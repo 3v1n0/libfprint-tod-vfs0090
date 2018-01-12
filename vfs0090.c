@@ -52,6 +52,9 @@ struct vfs_dev_t {
 	unsigned int buffer_length;
 
 	unsigned char key_block[0x120];
+
+	/* Current async transfer */
+	struct libusb_transfer *transfer;
 };
 
 /* DEBUGGG */
@@ -102,6 +105,136 @@ void print_hex(unsigned char *data, int len) {
 }
 
 /* remove emmmeeme */
+
+typedef void (*async_operation_cb)(struct fp_img_dev *idev, int status, void *data);
+
+struct async_usb_operation_data_t {
+	struct fp_img_dev *idev;
+	async_operation_cb callback;
+	void *callback_data;
+
+	gboolean completed;
+};
+
+static gboolean async_transfer_completed(struct fp_img_dev *idev)
+{
+	struct async_usb_operation_data_t *op_data;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	if (!vdev->transfer)
+		return TRUE;
+
+	op_data = vdev->transfer->user_data;
+	return op_data->completed;
+}
+
+static void async_write_callback(struct libusb_transfer *transfer)
+{
+	struct async_usb_operation_data_t *op_data = transfer->user_data;
+	struct fp_img_dev *idev = op_data->idev;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	op_data->completed = TRUE;
+
+	if (transfer->status != 0) {
+		fp_err("USB write transfer error: %s", libusb_error_name(transfer->status));
+		fpi_imgdev_session_error(idev, transfer->status);
+		goto out;
+	}
+
+	if (transfer->actual_length != transfer->length) {
+		fp_err("Written only %d of %d bytes",
+		       transfer->actual_length, transfer->length);
+		fpi_imgdev_session_error(idev, -EIO);
+		goto out;
+	}
+
+out:
+	vdev->transfer = NULL;
+
+	if (op_data->callback)
+		op_data->callback(idev, transfer->status, op_data->callback_data);
+
+	g_free(op_data);
+}
+
+static void async_write_to_usb(struct fp_img_dev *idev,
+			       const unsigned char *data, int data_size,
+			       async_operation_cb callback, void* callback_data)
+{
+	struct async_usb_operation_data_t *op_data;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	g_assert(async_transfer_completed(idev));
+
+	vdev->transfer = libusb_alloc_transfer(0);
+	vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
+
+	op_data = g_new0(struct async_usb_operation_data_t, 1);
+	op_data->idev = idev;
+	op_data->callback = callback;
+	op_data->callback_data = callback_data;
+
+	libusb_fill_bulk_transfer(vdev->transfer, idev->udev, 0x01,
+				  (unsigned char *) data, data_size,
+				  async_write_callback, op_data, VFS_USB_TIMEOUT);
+	libusb_submit_transfer(vdev->transfer);
+}
+
+static void async_read_callback(struct libusb_transfer *transfer)
+{
+	struct async_usb_operation_data_t *op_data = transfer->user_data;
+	struct fp_img_dev *idev = op_data->idev;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	vdev->buffer_length = 0;
+
+	if (transfer->status != 0) {
+		fp_err("USB read transfer error: %s",
+		       libusb_error_name(transfer->status));
+		fpi_imgdev_session_error(idev, transfer->status);
+		goto out;
+	}
+
+	vdev->buffer_length = transfer->actual_length;
+
+out:
+	if (op_data->callback)
+		op_data->callback(idev, transfer->status, op_data->callback_data);
+
+	g_free(op_data);
+}
+
+static void async_read_from_usb(struct fp_img_dev *idev, gboolean interrupt,
+				unsigned char *buffer, int buffer_size,
+				async_operation_cb callback, void* callback_data)
+{
+	struct async_usb_operation_data_t *op_data;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	g_assert(async_transfer_completed(idev));
+
+	vdev->transfer = libusb_alloc_transfer(0);
+	vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
+
+	op_data = g_new0(struct async_usb_operation_data_t, 1);
+	op_data->idev = idev;
+	op_data->callback = callback;
+	op_data->callback_data = callback_data;
+
+	if (interrupt)
+		libusb_fill_interrupt_transfer(vdev->transfer, idev->udev, 0x83,
+					       buffer, buffer_size,
+					       async_read_callback, op_data,
+					       VFS_USB_TIMEOUT);
+	else
+		libusb_fill_bulk_transfer(vdev->transfer, idev->udev, 0x81,
+					  buffer, buffer_size,
+					  async_read_callback, op_data,
+					  VFS_USB_TIMEOUT);
+
+	libusb_submit_transfer(vdev->transfer);
+}
 
 static void generate_main_seed(struct fp_img_dev *idev) {
 	struct vfs_dev_t *vdev = idev->priv;

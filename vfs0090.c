@@ -663,19 +663,6 @@ static void TLS_PRF2(const unsigned char *secret, int secret_len, char *str,
 	free(a);
 }
 
-static void make_master_key(struct vfs_dev_t *vdev)
-{
-	puts("prf seed");
-	print_hex(vdev->main_seed, vdev->main_seed_length);
-
-	TLS_PRF2(PRE_KEY, sizeof(PRE_KEY), "GWK", vdev->main_seed,
-		 vdev->main_seed_length,
-		 vdev->masterkey_aes, VFS_MASTER_KEY_SIZE);
-
-	puts("AES master:");
-	print_hex(vdev->masterkey_aes, VFS_MASTER_KEY_SIZE);
-}
-
 static gboolean check_pad(unsigned char *data, int len)
 {
     int pad_size = data[len - 1];
@@ -839,6 +826,9 @@ struct tls_handshake_t {
 	HASHContext *tls_hash_context;
 	HASHContext *tls_hash_context2;
 	unsigned char read_buffer[VFS_USB_BUFFER_SIZE];
+	unsigned char client_random[0x20];
+	unsigned char master_secret[0x30];
+	unsigned char *client_hello;
 };
 
 static void handshake_ssm(struct fpi_ssm *ssm)
@@ -850,45 +840,201 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 	switch(ssm->cur_state) {
 	case TLS_HANDSHAKE_STATE_CLIENT_HELLO:
 	{
-		unsigned char client_random[0x20];
-		unsigned char *client_hello;
 		time_t current_time;
+		unsigned char *client_hello;
+
+		tlshd->tls_hash_context = HASH_Create(HASH_AlgSHA256);
+		tlshd->tls_hash_context2 = HASH_Create(HASH_AlgSHA256);
+
+		HASH_Begin(tlshd->tls_hash_context);
+		HASH_Begin(tlshd->tls_hash_context2);
 
 		client_hello = malloc(G_N_ELEMENTS(TLS_CLIENT_HELLO));
+		tlshd->client_hello = client_hello;
 
 		current_time = time(NULL);
-		memcpy(client_random, &current_time, sizeof(time_t));
-		fill_buffer_with_random(client_random + 4, G_N_ELEMENTS(client_random) - 4);
+		memcpy(tlshd->client_random, &current_time, sizeof(time_t));
+		fill_buffer_with_random(tlshd->client_random + 4, G_N_ELEMENTS(tlshd->client_random) - 4);
 		puts("Client random");
-		print_hex(client_random, sizeof(client_random));
+		print_hex(tlshd->client_random, sizeof(tlshd->client_random));
 
 		memcpy(client_hello, TLS_CLIENT_HELLO, G_N_ELEMENTS(TLS_CLIENT_HELLO));
-		memcpy(client_hello + 0xf, client_random, G_N_ELEMENTS(client_random));
+		memcpy(client_hello + 0xf, tlshd->client_random, G_N_ELEMENTS(tlshd->client_random));
 		HASH_Update(tlshd->tls_hash_context, client_hello + 0x09, 0x43);
 		HASH_Update(tlshd->tls_hash_context2, client_hello + 0x09, 0x43);
 
+		puts("Sending Client hello");
+		print_hex(client_hello, sizeof(TLS_CLIENT_HELLO));
+
 		async_data_exchange(idev, client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
-		                    tlshd->read_buffer, VFS_USB_BUFFER_SIZE,
+				    tlshd->read_buffer, sizeof(tlshd->read_buffer),
 				    async_transfer_callback_with_ssm, ssm);
 
 		break;
 	}
-	case TLS_HANDSHAKE_STATE_SERVER_HELLO:
+	case TLS_HANDSHAKE_STATE_SERVER_HELLO_RCV:
 	{
+		unsigned char server_random[0x40];
+		unsigned char seed[0x40], expansion_seed[0x40];
+		unsigned char *pre_master_secret;
+		size_t pre_master_secret_len;
+
+		EC_KEY *priv_key, *pub_key;
+		EVP_PKEY_CTX *ctx;
+		EVP_PKEY *priv, *pub;
+
+		memcpy(server_random, tlshd->read_buffer + 0xb, G_N_ELEMENTS(server_random));
+		puts("Server tls Random:");
+		print_hex(server_random, G_N_ELEMENTS(server_random));
+		// printf("server len %d\n", len); // remove len!
+		HASH_Update(tlshd->tls_hash_context, tlshd->read_buffer + 0x05, 0x3d);
+		HASH_Update(tlshd->tls_hash_context2, tlshd->read_buffer + 0x05, 0x3d);
+
+		if (!(priv_key = load_key(PRIVKEY, TRUE))) {
+			fp_err("Impossible to load private key");
+			fpi_ssm_mark_aborted(ssm, -EIO);
+			break;
+		}
+
+		if (!(pub_key = load_key(vdev->pubkey, FALSE))) {
+			fp_err("Impossible to load private key");
+			fpi_ssm_mark_aborted(ssm, -EIO);
+			break;
+		}
+
+		priv = EVP_PKEY_new();
+		EVP_PKEY_set1_EC_KEY(priv, priv_key);
+		pub = EVP_PKEY_new();
+		EVP_PKEY_set1_EC_KEY(pub, pub_key);
+
+		ctx = EVP_PKEY_CTX_new(priv, NULL);
+
+		EVP_PKEY_derive_init(ctx);
+		EVP_PKEY_derive_set_peer(ctx, pub);
+
+		EVP_PKEY_derive(ctx, NULL, &pre_master_secret_len);
+
+		pre_master_secret = malloc(pre_master_secret_len);
+		if (!ECDH_compute_key(pre_master_secret, pre_master_secret_len, EC_KEY_get0_public_key(pub_key), priv_key, NULL)) {
+			fp_err("Failed to compute key, error: %lu, %s",
+			ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
+			fpi_ssm_mark_aborted(ssm, ERR_peek_last_error());
+			break;
+		}
+
+		memcpy(seed, tlshd->client_random, G_N_ELEMENTS(tlshd->client_random));
+		memcpy(seed + G_N_ELEMENTS(tlshd->client_random), server_random, G_N_ELEMENTS(seed) - G_N_ELEMENTS(tlshd->client_random));
+
+		memcpy(expansion_seed + (G_N_ELEMENTS(expansion_seed) - G_N_ELEMENTS(tlshd->client_random)), tlshd->client_random, G_N_ELEMENTS(tlshd->client_random));
+		memcpy(expansion_seed, server_random, G_N_ELEMENTS(expansion_seed) - G_N_ELEMENTS(tlshd->client_random));
+
+		TLS_PRF2(pre_master_secret, pre_master_secret_len, "master secret", seed, G_N_ELEMENTS(seed),
+			 tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret));
+		puts("master secret");
+		print_hex(tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret));
+
+		TLS_PRF2(tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret), "key expansion",
+			seed, G_N_ELEMENTS(seed), vdev->key_block, G_N_ELEMENTS(vdev->key_block));
+		puts("Keyblock");
+		print_hex(vdev->key_block, G_N_ELEMENTS(vdev->key_block));
+
+		g_free(pre_master_secret);
+		EC_KEY_free(priv_key);
+		EC_KEY_free(pub_key);
+		EVP_PKEY_free(priv);
+		EVP_PKEY_free(pub);
+		EVP_PKEY_CTX_free(ctx);
+
+		fpi_ssm_next_state(ssm);
+
 		break;
 	}
 	case TLS_HANDSHAKE_GENERATE_CERT:
 	{
+		EC_KEY *ecdsa_key;
+		unsigned char test[0x20];
+		unsigned char *cert_verify_signature, *final;
+		int len, test_len;
+
+		memcpy(vdev->tls_certificate + 0xce + 4, PRIVKEY, 0x40);
+
+		HASH_Update(tlshd->tls_hash_context, vdev->tls_certificate + 0x09, 0x109);
+		HASH_Update(tlshd->tls_hash_context2, vdev->tls_certificate + 0x09, 0x109);
+
+		HASH_End(tlshd->tls_hash_context, test, &test_len, G_N_ELEMENTS(test));
+		puts("Hash");
+		print_hex(test, 0x20);
+
+		ecdsa_key = load_key(vdev->ecdsa_private_key, TRUE);
+		cert_verify_signature = sign2(ecdsa_key, test, 0x20);
+
+		printf("\nCert signed: \n");
+		print_hex(cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
+		memcpy(vdev->tls_certificate + 0x09 + 0x109 + 0x04, cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
+
+		// encrypted finished
+		unsigned char handshake_messages[0x20]; int len3 = 0x20;
+		HASH_Update(tlshd->tls_hash_context2, vdev->tls_certificate + 0x09 + 0x109, 0x4c);
+		HASH_End(tlshd->tls_hash_context2, handshake_messages, &len3, 0x20);
+
+		puts("hash of handshake messages");
+		print_hex(handshake_messages, 0x20); // ok
+
+		unsigned char finished_message[0x10] = { 0x14, 0x00, 0x00, 0x0c, 0 };
+		print_hex(finished_message, 0x10);
+		unsigned char client_finished[0x0c];
+		TLS_PRF2(tlshd->master_secret, 0x30, "client finished", handshake_messages, 0x20,
+			client_finished, G_N_ELEMENTS(client_finished));
+		memcpy(finished_message + 0x04, client_finished, G_N_ELEMENTS(client_finished));
+		// copy handshake protocol
+
+		puts("client finished");
+		print_hex(finished_message, 0x10);
+
+		mac_then_encrypt(0x16, vdev->key_block, finished_message, 0x10, &final, &len);
+		memcpy(vdev->tls_certificate + 0x169, final, len);
+
+		puts("final");
+		print_hex(final, len);
+
+		EC_KEY_free(ecdsa_key);
+
+		g_free(cert_verify_signature);
+		g_free(final);
+
+		fpi_ssm_next_state(ssm);
+
 		break;
 	}
 	case TLS_HANDSHAKE_STATE_SEND_CERT:
 	{
+		async_data_exchange(idev, vdev->tls_certificate,
+				    sizeof(vdev->tls_certificate),
+				    tlshd->read_buffer, VFS_USB_BUFFER_SIZE,
+				    async_transfer_callback_with_ssm, ssm);
+
 		break;
 	}
 	case TLS_HANDSHAKE_STATE_CERT_REPLY:
 	{
+		const unsigned char WRONG_TLS_CERT_RSP[] = { 0x15, 0x03, 0x03, 0x00, 0x02 };
+
+		if (vdev->buffer_length < 50 ||
+		    memcmp (tlshd->read_buffer, WRONG_TLS_CERT_RSP, MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
+			print_hex(tlshd->read_buffer, vdev->buffer_length);
+			fp_err("TLS Certificate submitted isn't accepted by reader");
+			fpi_ssm_mark_aborted(ssm, -EIO);
+			break;
+		}
+
+		fpi_ssm_next_state(ssm);
+
 		break;
 	}
+	default:
+		fp_err("Unknown state");
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
 	}
 }
 
@@ -896,12 +1042,20 @@ static void handshake_ssm_cb(struct fpi_ssm *ssm)
 {
 	struct tls_handshake_t *tlshd = ssm->priv;
 	struct fpi_ssm *parent_ssm = tlshd->parent_ssm;
+	struct fp_img_dev *idev = tlshd->idev;
+
+	if (ssm->error) {
+		fpi_imgdev_session_error(idev, ssm->error);
+		fpi_ssm_mark_aborted(parent_ssm, ssm->error);
+	} else {
+		fpi_ssm_next_state(parent_ssm);
+	}
 
 	HASH_Destroy(tlshd->tls_hash_context);
 	HASH_Destroy(tlshd->tls_hash_context2);
+	g_clear_pointer(&tlshd->client_hello, g_free);
 	g_free(tlshd);
-
-	fpi_ssm_next_state(parent_ssm);
+	fpi_ssm_free(ssm);
 }
 
 static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm)
@@ -911,11 +1065,6 @@ static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_
 	tlshd = g_new0(struct tls_handshake_t, 1);
 	tlshd->idev = idev;
 	tlshd->parent_ssm = parent_ssm;
-	tlshd->tls_hash_context = HASH_Create(HASH_AlgSHA256);
-	tlshd->tls_hash_context2 = HASH_Create(HASH_AlgSHA256);
-
-	HASH_Begin(tlshd->tls_hash_context);
-	HASH_Begin(tlshd->tls_hash_context2);
 
 	struct fpi_ssm *ssm =
 	    fpi_ssm_new(idev->dev, handshake_ssm, TLS_HANDSHAKE_STATE_LAST);
@@ -924,200 +1073,203 @@ static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_
 	fpi_ssm_start(ssm, handshake_ssm_cb);
 }
 
-static gboolean handshake(struct fp_img_dev *idev)
-{
-	struct vfs_dev_t *vdev = idev->priv;
-	unsigned char *client_hello;
-	unsigned char read_buffer[VFS_USB_BUFFER_SIZE];
-	unsigned char server_random[0x40];
-	unsigned char client_random[0x20];
-	unsigned char seed[0x40], expansion_seed[0x40];
-	unsigned char master_secret[0x30];
-	unsigned char *pre_master_secret, *cert_verify_signature;
-	unsigned char *final;
-	size_t pre_master_secret_len;
-	time_t current_time;
-	EVP_PKEY_CTX *ctx;
-	EC_KEY *priv_key, *pub_key, *ecdsa_key;
-	EVP_PKEY *priv, *pub;
-	int len;
-	int ret;
+/*
+int writeImage(char* filename, int width, int height, float *buffer) {
+    int code = 0;
+    FILE *fp = NULL;
+    png_structp png_ptr = NULL;
+    png_infop info_ptr = NULL;
 
-	client_hello = malloc(G_N_ELEMENTS(TLS_CLIENT_HELLO));
-	pre_master_secret = NULL;
-	cert_verify_signature = NULL;
-	priv = NULL;
-	pub = NULL;
-	priv_key = NULL;
-	pub_key = NULL;
-	ecdsa_key = NULL;
-	ctx = NULL;
-	final = NULL;
+    // Open file for writing (binary mode)
+    fp = fopen(filename, "wb");
+    if (fp == NULL) {
+	fprintf(stderr, "Could not open file %s for writing\n", filename);
+	code = 1;
+	goto finalise;
+    }
 
-	ret = FALSE;
+    // Initialize write structure
+    png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (png_ptr == NULL) {
+	fprintf(stderr, "Could not allocate write struct\n");
+	code = 1;
+	goto finalise;
+    }
 
-	HASHContext *tls_hash_context = HASH_Create(HASH_AlgSHA256);
-	HASHContext *tls_hash_context2 = HASH_Create(HASH_AlgSHA256);
-	HASH_Begin(tls_hash_context);
-	HASH_Begin(tls_hash_context2);
+    // Initialize info structure
+    info_ptr = png_create_info_struct(png_ptr);
+    if (info_ptr == NULL) {
+	fprintf(stderr, "Could not allocate info struct\n");
+	code = 1;
+	goto finalise;
+    }
 
-	/* Send ClientHello */
-	current_time = time(NULL);
-	memcpy(client_random, &current_time, sizeof(time_t));
-	fill_buffer_with_random(client_random + 4, G_N_ELEMENTS(client_random) - 4);
-	puts("Client random");
-	print_hex(client_random, sizeof(client_random));
+    // Setup Exception handling
+    if (setjmp(png_jmpbuf(png_ptr))) {
+	fprintf(stderr, "Error during png creation\n");
+	code = 1;
+	goto finalise;
+    }
 
-	memcpy(client_hello, TLS_CLIENT_HELLO, G_N_ELEMENTS(TLS_CLIENT_HELLO));
-	memcpy(client_hello + 0xf, client_random, G_N_ELEMENTS(client_random));
-	HASH_Update(tls_hash_context, client_hello + 0x09, 0x43);
-	HASH_Update(tls_hash_context2, client_hello + 0x09, 0x43);
+    png_init_io(png_ptr, fp);
 
-	puts("Sending Client hello");
-	print_hex(client_hello, sizeof(TLS_CLIENT_HELLO));
+    // Write header (8 bit colour depth)
+    png_set_IHDR(png_ptr, info_ptr, width, height,
+	    8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
+	    PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
 
-	if (!write_to_usb(idev, client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO)))
-		goto out;
 
-	/* Receive ServerHello */
-	if (!read_from_usb(idev, read_buffer, VFS_USB_BUFFER_SIZE, &len))
-		goto out;
+    png_write_info(png_ptr, info_ptr);
 
-	memcpy(server_random, read_buffer + 0xb, G_N_ELEMENTS(server_random));
-	puts("Server tls Random:");
-	print_hex(server_random, G_N_ELEMENTS(server_random));
-	printf("server len %d\n", len); // remove len!
-	HASH_Update(tls_hash_context, read_buffer + 0x05, 0x3d);
-	HASH_Update(tls_hash_context2, read_buffer + 0x05, 0x3d);
+    // Write image data
+    int x, y;
+    for (y=0 ; y<height ; y++) {
+       png_write_row(png_ptr, buffer + 36 * y);
+    }
 
-	/* Send cert */
-	if (!(priv_key = load_key(PRIVKEY, TRUE)))
-		goto out;
+    // End write
+    png_write_end(png_ptr, NULL);
 
-	if (!(pub_key = load_key(vdev->pubkey, FALSE)))
-		goto out;
+    finalise:
+    if (fp != NULL) fclose(fp);
+    if (info_ptr != NULL) png_free_data(png_ptr, info_ptr, PNG_FREE_ALL, -1);
+    if (png_ptr != NULL) png_destroy_write_struct(&png_ptr, (png_infopp)NULL);
 
-	priv = EVP_PKEY_new();
-	EVP_PKEY_set1_EC_KEY(priv, priv_key);
-	pub = EVP_PKEY_new();
-	EVP_PKEY_set1_EC_KEY(pub, pub_key);
+    return code;
+}
+*/
+static void fingerprint(struct fp_img_dev *idev) {
+    // const unsigned char data1[] = {
+    //     0x08, 0x5c, 0x20, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x04
+    // };
+    // const unsigned char data2[] = {
+    //     0x07, 0x80, 0x20, 0x00, 0x80, 0x04
+    // };
+    // const unsigned char data345[] = {
+    //     0x75
+    // };
+    // const unsigned char data67[] = {
+    //     0x43, 0x02
+    // };
 
-	ctx = EVP_PKEY_CTX_new(priv, NULL);
+    const unsigned char data10[] = {
+	0x51, 0x00, 0x20, 0x00, 0x00 // read data - return buffer
+    };
+    // unsigned char data11[] = {
+    //     0x51, 0x00, 0x20, 0x00, 0x00
+    // };
 
-	EVP_PKEY_derive_init(ctx);
-	EVP_PKEY_derive_set_peer(ctx, pub);
+    unsigned char response[1024 * 1024];
+    int response_len = 0;
 
-	EVP_PKEY_derive(ctx, NULL, &pre_master_secret_len);
+    // tls_write_to_usb(idev, data1, sizeof(data1));
+    // tls_read_from_usb(idev, response, &response_len);
+    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
+    // // puts("READ:");print_hex(response, response_len);
 
-	pre_master_secret = malloc(pre_master_secret_len);
-	if (!ECDH_compute_key(pre_master_secret, pre_master_secret_len, EC_KEY_get0_public_key(pub_key), priv_key, NULL)) {
-		fp_err("Failed to compute key, error: %lu, %s",
-		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+    // tls_write_to_usb(idev, data2, sizeof(data2));
+    // tls_read_from_usb(idev, response, &response_len);
+    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
+    // // puts("READ:");print_hex(response, response_len);
+
+    // for (int i =0; i < 3; i++ ){
+    //     tls_write_to_usb(idev, data345, sizeof(data345));
+    //     tls_read_from_usb(idev, response, &response_len);
+    //     g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
+    //     // puts("READ:");print_hex(response, response_len);
+    // }
+
+    // for (int i =0; i < 2; i++ ){
+    //     tls_write_to_usb(idev, data67, sizeof(data67));
+    //     tls_read_from_usb(idev, response, &response_len);
+    //     g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
+    //     // puts("READ:");print_hex(response, response_len);
+    // }
+    // g_print("SCAN MATRIX SEND\n");
+
+
+    // tls_write_to_usb(idev, SCAN_MATRIX2, sizeof(SCAN_MATRIX2));
+    // tls_read_from_usb(idev, response, &response_len);
+    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
+    // // puts("READ:");print_hex(response, response_len);
+
+    // tls_write_to_usb(idev, SCAN_MATRIX1, sizeof(SCAN_MATRIX1));
+    // tls_read_from_usb(idev, response, &response_len);
+    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
+    // // puts("READ:");print_hex(response, response_len);
+
+    unsigned char interrupt[0x100];
+    int interrupt_len;
+
+    const unsigned char desired_interrupt[] = { 0x03, 0x43, 0x04, 0x00, 0x41 };
+    const unsigned char other_scan_interrupt[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
+    const unsigned char scan_failed_swipe_interrupt[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
+    const unsigned char scan_failed_toofast_interrupt[] = { 0x03, 0x20, 0x07, 0x00, 0x00 };
+
+    puts("Awaiting fingerprint:");
+    while (TRUE) {
+	int status = libusb_interrupt_transfer(idev->udev, 0x83, interrupt, 0x100, &interrupt_len, 5 * 1000);
+	if (status == 0) {
+	    puts("interrupt:");
+	    print_hex(interrupt, interrupt_len);
+	    fflush(stdout);
+
+	    if (sizeof(desired_interrupt) == interrupt_len &&
+		    memcmp(desired_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
+		break;
+	    }
+	    if (sizeof(other_scan_interrupt) == interrupt_len &&
+		    memcmp(other_scan_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
+		printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
+		break;
+	    }
+	    if (sizeof(scan_failed_swipe_interrupt) == interrupt_len &&
+		    memcmp(scan_failed_swipe_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
+		puts("scan failed, swipe!");
+		return;
+	    }
+	    if (sizeof(scan_failed_toofast_interrupt) == interrupt_len &&
+		    memcmp(scan_failed_toofast_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
+		puts("scan failed, too fast");
+		return;
+	    }
 	}
+    }
 
-	memcpy(seed, client_random, G_N_ELEMENTS(client_random));
-	memcpy(seed + G_N_ELEMENTS(client_random), server_random, G_N_ELEMENTS(seed) - G_N_ELEMENTS(client_random));
+    unsigned char image[144 * 144];
+    int image_len = 0;
 
-	memcpy(expansion_seed + (G_N_ELEMENTS(expansion_seed) - G_N_ELEMENTS(client_random)), client_random, G_N_ELEMENTS(client_random));
-	memcpy(expansion_seed, server_random, G_N_ELEMENTS(expansion_seed) - G_N_ELEMENTS(client_random));
+    tls_write_to_usb(idev, data10, sizeof(data10));
+    tls_read_from_usb(idev, response, &response_len);
+    memcpy(image, response + 0x12, response_len - 0x12);
+    image_len += response_len - 0x12;
 
-	TLS_PRF2(pre_master_secret, pre_master_secret_len, "master secret", seed, G_N_ELEMENTS(seed),
-		 master_secret, G_N_ELEMENTS(master_secret));
-	puts("master secret");
-	print_hex(master_secret, G_N_ELEMENTS(master_secret));
+    tls_write_to_usb(idev, data10, sizeof(data10));
+    tls_read_from_usb(idev, response, &response_len);
+    memcpy(image + image_len, response + 0x06, response_len - 0x06);
+    image_len += response_len - 0x06;
 
-	TLS_PRF2(master_secret, G_N_ELEMENTS(master_secret), "key expansion",
-		 seed, G_N_ELEMENTS(seed), vdev->key_block, G_N_ELEMENTS(vdev->key_block));
-	puts("Keyblock");
-	print_hex(vdev->key_block, G_N_ELEMENTS(vdev->key_block));
+    tls_write_to_usb(idev, data10, sizeof(data10));
+    tls_read_from_usb(idev, response, &response_len);
+    memcpy(image + image_len, response + 0x06, response_len - 0x06);
+    image_len += response_len - 0x06;
 
-	memcpy(vdev->tls_certificate + 0xce + 4, PRIVKEY, 0x40);
+    printf("total len  %d\n", image_len);
+    char nameprefix[80];
+    static int number_of_img = 0;
+    sprintf(nameprefix, "img %d.png",number_of_img);
+    // writeImage(nameprefix, 144, 144, image);
 
-	HASH_Update(tls_hash_context, vdev->tls_certificate + 0x09, 0x109);
-	HASH_Update(tls_hash_context2, vdev->tls_certificate + 0x09, 0x109);
+    sprintf(nameprefix, "img %d.raw",number_of_img);
+    FILE *f = fopen(nameprefix, "wb");
+    fwrite(image, 144, 144, f);
+    fclose(f);
 
-	unsigned char test[0x20];int test_len;
-	HASH_End(tls_hash_context, test, &test_len, G_N_ELEMENTS(test));
-	puts("Hash");
-	print_hex(test, 0x20);
+    char msg[80];
+    sprintf(msg, "Image written - img %d.png, img %d.raw",number_of_img,number_of_img);
+    puts(msg);
 
-	ecdsa_key = load_key(vdev->ecdsa_private_key, TRUE);
-	cert_verify_signature = sign2(ecdsa_key, test, 0x20);
-
-	printf("\nCert signed: \n");
-	print_hex(cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
-	memcpy(vdev->tls_certificate + 0x09 + 0x109 + 0x04, cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
-
-    // encrypted finished
-	unsigned char handshake_messages[0x20]; int len3 = 0x20;
-	HASH_Update(tls_hash_context2, vdev->tls_certificate + 0x09 + 0x109, 0x4c);
-	HASH_End(tls_hash_context2, handshake_messages, &len3, 0x20);
-
-	puts("hash of handshake messages");
-	print_hex(handshake_messages, 0x20); // ok
-
-	unsigned char finished_message[0x10] = { 0x14, 0x00, 0x00, 0x0c, 0 };
-	print_hex(finished_message, 0x10);
-	unsigned char client_finished[0x0c];
-	TLS_PRF2(master_secret, 0x30, "client finished", handshake_messages, 0x20,
-		 client_finished, G_N_ELEMENTS(client_finished));
-	memcpy(finished_message + 0x04, client_finished, G_N_ELEMENTS(client_finished));
-	// copy handshake protocol
-
-	puts("client finished");
-	print_hex(finished_message, 0x10);
-
-	mac_then_encrypt(0x16, vdev->key_block, finished_message, 0x10, &final, &len);
-	memcpy(vdev->tls_certificate + 0x169, final, len);
-
-	puts("final");
-	print_hex(final, len);
-
-	if (!write_to_usb(idev, vdev->tls_certificate, sizeof(vdev->tls_certificate)))
-		goto out;
-
-	if (!read_from_usb(idev, read_buffer, VFS_USB_BUFFER_SIZE, &len))
-		goto out;
-
-	printf("TLS GOOd result %d\n",len);
-	print_hex(read_buffer,len);
-	const unsigned char WRONG_TLS_CERT_RSP[] = { 0x15, 0x03, 0x03, 0x00, 0x02 };
-
-	if (len < 50 || memcmp (read_buffer, WRONG_TLS_CERT_RSP, MIN(len, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
-		fp_err("TLS Certificate submitted isn't accepted by reader");
-		goto out;
-	}
-//         TLS WRONG result
-// 0000 0x15 0x03 0x03 0x00 0x02 0x02 0x14
-
-	/*
-TLS GOOD result
-0000 14 03 03 00 01 01 16 03  03 00 50 29 75 4b f2 47  | ..........P)uK.G
-0010 c7 15 2c 68 96 32 64 7f  7c 5c ac 01 36 9a ea ba  | ..,h.2d.|\..6...
-0020 cb e2 b7 8b 6b 58 14 13  e0 3b be 2d 4d e9 11 ad  | ....kX...;.-M...
-0030 3b 9b 60 8c 09 56 ec 0b  a9 17 6d 7a 56 4c 4f 6e  | ;.`..V....mzVLOn
-0040 5d 6a a7 9e d6 a6 39 38  40 68 ef 4c 4b 19 34 bf  | ]j....98@h.LK.4.
-0050 5f 9b c9 52 7c fc ea 68  f4 b6 47                 | _..R|..h..G
-	*/
-
-	ret = TRUE;
-
-	out:
-	HASH_Destroy(tls_hash_context);
-	HASH_Destroy(tls_hash_context2);
-	EC_KEY_free(priv_key);
-	EC_KEY_free(pub_key);
-	EC_KEY_free(ecdsa_key);
-	EVP_PKEY_free(priv);
-	EVP_PKEY_free(pub);
-	EVP_PKEY_CTX_free(ctx);
-	g_free(client_hello);
-	g_free(pre_master_secret);
-	g_free(cert_verify_signature);
-	g_free(final);
-
-	return ret;
+    ++number_of_img;
 }
 
 static int wait_for_finger_state(struct fp_img_dev *idev) {
@@ -1260,13 +1412,20 @@ static void init_ssm(struct fpi_ssm *ssm)
 	case INIT_STATE_SEQ_4:
 	case INIT_STATE_SEQ_5:
 	case INIT_STATE_SEQ_6:
-		printf("State %d\n",ssm->cur_state);
 		send_init_sequence(ssm, ssm->cur_state - INIT_STATE_SEQ_1);
-
 		break;
 
 	case INIT_STATE_MASTER_KEY:
-		make_master_key(vdev);
+		puts("prf seed");
+		print_hex(vdev->main_seed, vdev->main_seed_length);
+
+		TLS_PRF2(PRE_KEY, sizeof(PRE_KEY), "GWK", vdev->main_seed,
+			vdev->main_seed_length,
+			vdev->masterkey_aes, VFS_MASTER_KEY_SIZE);
+
+		puts("AES master:");
+		print_hex(vdev->masterkey_aes, VFS_MASTER_KEY_SIZE);
+
 		fpi_ssm_next_state(ssm);
 		break;
 
@@ -1283,6 +1442,7 @@ static void init_ssm(struct fpi_ssm *ssm)
 
 	case INIT_STATE_TLS_CERT:
 		memcpy(vdev->tls_certificate + 21, vdev->buffer + 0x116, 0xb8);
+
 		fpi_ssm_next_state(ssm);
 		break;
 
@@ -1320,7 +1480,9 @@ static void dev_open_callback(struct fpi_ssm *ssm)
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	fpi_imgdev_session_error(idev, ssm->error);
+	if (ssm->error)
+		fpi_imgdev_session_error(idev, ssm->error);
+
 	fpi_imgdev_open_complete(idev, ssm->error);
 
 	fpi_ssm_free(ssm);
@@ -1373,7 +1535,7 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	return 0;
 }
 
-/* Callback for dev_open ssm */
+/* Callback for dev_activate ssm */
 static void dev_activate_callback(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *idev = ssm->priv;

@@ -276,6 +276,19 @@ static void async_data_exchange(struct fp_img_dev *idev,
 	async_write_to_usb(idev, data, data_size, on_async_data_exchange_cb, dex);
 }
 
+static void async_transfer_callback_with_ssm(struct fp_img_dev *idev,
+					     int status, void *data)
+{
+	struct fpi_ssm *ssm = data;
+
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		fpi_ssm_next_state(ssm);
+	} else {
+		fpi_imgdev_session_error(idev, status);
+		fpi_ssm_mark_aborted(ssm, status);
+	}
+}
+
 static void generate_main_seed(struct fp_img_dev *idev) {
 	struct vfs_dev_t *vdev = idev->priv;
 	char name[NAME_MAX], serial[NAME_MAX];
@@ -820,6 +833,102 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
     return res;
 }
 
+struct tls_handshake_t {
+	struct fp_img_dev *idev;
+	struct fpi_ssm *parent_ssm;
+	HASHContext *tls_hash_context;
+	HASHContext *tls_hash_context2;
+	unsigned char read_buffer[VFS_USB_BUFFER_SIZE];
+};
+
+static void handshake_ssm(struct fpi_ssm *ssm)
+{
+	struct tls_handshake_t *tlshd = ssm->priv;
+	struct fp_img_dev *idev = tlshd->idev;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	switch(ssm->cur_state) {
+	case TLS_HANDSHAKE_STATE_CLIENT_HELLO_SND:
+	{
+		unsigned char client_random[0x20];
+		unsigned char *client_hello;
+		time_t current_time;
+
+		client_hello = malloc(G_N_ELEMENTS(TLS_CLIENT_HELLO));
+
+		current_time = time(NULL);
+		memcpy(client_random, &current_time, sizeof(time_t));
+		fill_buffer_with_random(client_random + 4, G_N_ELEMENTS(client_random) - 4);
+		puts("Client random");
+		print_hex(client_random, sizeof(client_random));
+
+		memcpy(client_hello, TLS_CLIENT_HELLO, G_N_ELEMENTS(TLS_CLIENT_HELLO));
+		memcpy(client_hello + 0xf, client_random, G_N_ELEMENTS(client_random));
+		HASH_Update(tlshd->tls_hash_context, client_hello + 0x09, 0x43);
+		HASH_Update(tlshd->tls_hash_context2, client_hello + 0x09, 0x43);
+
+		async_write_to_usb(idev, client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
+				   async_transfer_callback_with_ssm, ssm);
+
+		break;
+	}
+	case TLS_HANDSHAKE_STATE_CLIENT_HELLO_RCV:
+	{
+		async_read_from_usb(idev, FALSE, tlshd->read_buffer,
+				    VFS_USB_BUFFER_SIZE,
+				    async_transfer_callback_with_ssm, ssm);
+	}
+	case TLS_HANDSHAKE_STATE_SERVER_HELLO_SND:
+	{
+		break;
+	}
+	case TLS_HANDSHAKE_GENERATE_CERT:
+	{
+		break;
+	}
+	case TLS_HANDSHAKE_STATE_SEND_CERT:
+	{
+		break;
+	}
+	case TLS_HANDSHAKE_STATE_CERT_REPLY:
+	{
+		break;
+	}
+	}
+}
+
+static void handshake_ssm_cb(struct fpi_ssm *ssm)
+{
+	struct tls_handshake_t *tlshd = ssm->priv;
+	struct fpi_ssm *parent_ssm = tlshd->parent_ssm;
+
+	HASH_Destroy(tlshd->tls_hash_context);
+	HASH_Destroy(tlshd->tls_hash_context2);
+	g_free(tlshd);
+
+	fpi_ssm_next_state(parent_ssm);
+}
+
+static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm)
+{
+	struct tls_handshake_t *tlshd;
+
+	tlshd = g_new0(struct tls_handshake_t, 1);
+	tlshd->idev = idev;
+	tlshd->parent_ssm = parent_ssm;
+	tlshd->tls_hash_context = HASH_Create(HASH_AlgSHA256);
+	tlshd->tls_hash_context2 = HASH_Create(HASH_AlgSHA256);
+
+	HASH_Begin(tlshd->tls_hash_context);
+	HASH_Begin(tlshd->tls_hash_context2);
+
+	struct fpi_ssm *ssm =
+	    fpi_ssm_new(idev->dev, handshake_ssm, TLS_HANDSHAKE_STATE_LAST);
+
+	ssm->priv = tlshd;
+	fpi_ssm_start(ssm, handshake_ssm_cb);
+}
+
 static gboolean handshake(struct fp_img_dev *idev)
 {
 	struct vfs_dev_t *vdev = idev->priv;
@@ -1197,14 +1306,7 @@ static void init_ssm(struct fpi_ssm *ssm)
 		break;
 	}
 	case INIT_STATE_HANDSHAKE:
-		if (handshake(idev)) {
-			fpi_ssm_next_state(ssm);
-		} else {
-			fp_err("Initialization failed at state %d, handshake",
-			       ssm->cur_state);
-			fpi_imgdev_session_error(idev, -EIO);
-			fpi_ssm_mark_aborted(ssm, -EIO);
-		}
+		start_handshake_ssm(idev, ssm);
 		break;
 	default:
 		fp_err("Unknown state");

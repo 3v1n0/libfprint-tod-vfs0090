@@ -472,34 +472,48 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	EVP_CIPHER_CTX_free(context);
 }
 
-gboolean tls_write_to_usb(struct fp_img_dev *idev, const unsigned char *data, int data_len) {
+static unsigned char *tls_encrypt(struct fp_img_dev *idev,
+				  const unsigned char *data, int data_size,
+				  int *encrypted_len_out) {
 	struct vfs_dev_t *vdev;
-	gboolean ret;
-	unsigned char *res;
+	unsigned char *res, *wr;
 	int res_len;
 
 	vdev = idev->priv;
-	mac_then_encrypt(0x17, vdev->key_block, data, data_len, &res, &res_len);
-	unsigned char *wr = malloc(res_len + 5);
+
+	mac_then_encrypt(0x17, vdev->key_block, data, data_size, &res, &res_len);
+
+	wr = malloc(res_len + 5);
 	memcpy(wr + 5, res, res_len);
 	wr[0] = 0x17; wr[1] = wr[2] = 0x03; wr[3] = res_len >> 8; wr[4] = res_len & 0xFF;
-	ret = write_to_usb(idev, wr, res_len + 5);
+
+	*encrypted_len_out = res_len + 5;
 
 	free(res);
-	free(wr);
+
+	return wr;
+}
+
+gboolean tls_write_to_usb(struct fp_img_dev *idev, const unsigned char *data, int data_len) {
+	unsigned char *encrypted;
+	int encrypted_len;
+	gboolean ret;
+
+	encrypted = tls_encrypt(idev, data, data_len, &encrypted_len);
+	ret = write_to_usb(idev, encrypted, encrypted_len);
+	free(encrypted);
 
 	return ret;
 }
 
-gboolean tls_read_from_usb(struct fp_img_dev *idev, unsigned char *output_buffer, int *output_len) {
-	unsigned char raw_buff[VFS_USB_BUFFER_SIZE];
+static gboolean tls_decrypt(struct fp_img_dev *idev,
+			    const unsigned char *buffer, int buffer_size,
+			    unsigned char *output_buffer, int *output_len)
+{
 	struct vfs_dev_t *vdev = idev->priv;
-	int raw_buff_len;
 
-	read_from_usb(idev, raw_buff, sizeof(raw_buff), &raw_buff_len);
-
-	int buff_len = raw_buff_len - 5;
-	unsigned char *buff = raw_buff + 5;
+	int buff_len = buffer_size - 5;
+	const unsigned char *buff = buffer + 5;
 	gboolean ret = FALSE;
 	*output_len = 0;
 
@@ -534,6 +548,17 @@ gboolean tls_read_from_usb(struct fp_img_dev *idev, unsigned char *output_buffer
 	EVP_CIPHER_CTX_free(context);
 
 	return ret;
+}
+
+gboolean tls_read_from_usb(struct fp_img_dev *idev, unsigned char *output_buffer, int *output_len) {
+	unsigned char raw_buff[VFS_USB_BUFFER_SIZE];
+	int raw_buff_len;
+
+	if (read_from_usb(idev, raw_buff, sizeof(raw_buff), &raw_buff_len))
+		if (tls_decrypt(idev, raw_buff, raw_buff_len, output_buffer, output_len))
+			return TRUE;
+
+	return FALSE;
 }
 
 static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)

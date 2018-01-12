@@ -848,7 +848,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	switch(ssm->cur_state) {
-	case TLS_HANDSHAKE_STATE_CLIENT_HELLO_SND:
+	case TLS_HANDSHAKE_STATE_CLIENT_HELLO:
 	{
 		unsigned char client_random[0x20];
 		unsigned char *client_hello;
@@ -867,18 +867,13 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		HASH_Update(tlshd->tls_hash_context, client_hello + 0x09, 0x43);
 		HASH_Update(tlshd->tls_hash_context2, client_hello + 0x09, 0x43);
 
-		async_write_to_usb(idev, client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
-				   async_transfer_callback_with_ssm, ssm);
+		async_data_exchange(idev, client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
+		                    tlshd->read_buffer, VFS_USB_BUFFER_SIZE,
+				    async_transfer_callback_with_ssm, ssm);
 
 		break;
 	}
-	case TLS_HANDSHAKE_STATE_CLIENT_HELLO_RCV:
-	{
-		async_read_from_usb(idev, FALSE, tlshd->read_buffer,
-				    VFS_USB_BUFFER_SIZE,
-				    async_transfer_callback_with_ssm, ssm);
-	}
-	case TLS_HANDSHAKE_STATE_SERVER_HELLO_SND:
+	case TLS_HANDSHAKE_STATE_SERVER_HELLO:
 	{
 		break;
 	}

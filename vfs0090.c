@@ -199,6 +199,8 @@ static void async_read_callback(struct libusb_transfer *transfer)
 	vdev->buffer_length = transfer->actual_length;
 
 out:
+	vdev->transfer = NULL;
+
 	if (op_data->callback)
 		op_data->callback(idev, transfer->status, op_data->callback_data);
 
@@ -234,6 +236,44 @@ static void async_read_from_usb(struct fp_img_dev *idev, gboolean interrupt,
 					  VFS_USB_TIMEOUT);
 
 	libusb_submit_transfer(vdev->transfer);
+}
+
+struct async_data_exchange_t {
+	async_operation_cb callback;
+	unsigned char *buffer;
+	int buffer_size;
+	void* callback_data;
+};
+
+static void on_async_data_exchange_cb(struct fp_img_dev *idev,
+				      int status, void *data)
+{
+	struct async_data_exchange_t *dex = data;
+
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		async_read_from_usb(idev, FALSE, dex->buffer, dex->buffer_size,
+				    dex->callback, dex->callback_data);
+	} else if (dex->callback) {
+		dex->callback(idev, status, dex->callback_data);
+	}
+
+	g_free(dex);
+}
+
+static void async_data_exchange(struct fp_img_dev *idev,
+				const unsigned char *data, int data_size,
+				unsigned char *buffer, int buffer_size,
+				async_operation_cb callback, void* callback_data)
+{
+	struct async_data_exchange_t *dex;
+
+	dex = g_new0(struct async_data_exchange_t, 1);
+	dex->buffer = buffer;
+	dex->buffer_size = buffer_size;
+	dex->callback = callback;
+	dex->callback_data = callback_data;
+
+	async_write_to_usb(idev, data, data_size, on_async_data_exchange_cb, dex);
 }
 
 static void generate_main_seed(struct fp_img_dev *idev) {

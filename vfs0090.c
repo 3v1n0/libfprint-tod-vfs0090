@@ -483,10 +483,33 @@ gboolean tls_read_from_usb(struct fp_img_dev *idev, unsigned char *output_buffer
 	return ret;
 }
 
+static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
+{
+	int i;
+
+	if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
+		fp_err("Expected len: %d, but got %d\n",
+		       dex->rsp_length, vdev->buffer_length);
+		return FALSE;
+	} else if (dex->rsp_length > 0 && dex->rsp != NULL) {
+		const unsigned char *expected = dex->rsp;
+
+		for (i = 0; i < vdev->buffer_length; ++i) {
+			if (vdev->buffer[i] != expected[i]) {
+				fp_warn("Reply mismatch, expected at char %d "
+					"(actual 0x%x, expected  0x%x)",
+					i, vdev->buffer[i], expected[i]);
+				return FALSE;
+			}
+		}
+	}
+
+	return TRUE;
+}
+
 static gboolean do_data_exchange(struct fp_img_dev *idev, const struct data_exchange_t *dex, int mode)
 {
 	struct vfs_dev_t *vdev = idev->priv;
-	int i;
 
  //        g_clear_pointer(&vdev->buffer, g_free);
 	// vdev->buffer = g_malloc0(VFS_USB_BUFFER_SIZE);
@@ -516,29 +539,57 @@ static gboolean do_data_exchange(struct fp_img_dev *idev, const struct data_exch
 
 	printf("Read len is %d, expected %d\n",vdev->buffer_length,dex->rsp_length);
 
-	if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
-		fp_err("Expected len: %d, but got %d\n",
-		       dex->rsp_length, vdev->buffer_length);
-		return FALSE;
-	} else if (dex->rsp_length > 0 && dex->rsp != NULL) {
-		const unsigned char *expected = dex->rsp;
-
-		for (i = 0; i < vdev->buffer_length; ++i) {
-			if (vdev->buffer[i] != expected[i]) {
-				fp_warn("Reply mismatch, expected at char %d "
-					"(actual 0x%x, expected  0x%x)",
-					i, vdev->buffer[i], expected[i]);
-				return FALSE;
-			}
-		}
-	}
-
-	return TRUE;
+	return check_data_exchange(vdev, dex);
 }
 
-static gboolean send_init_sequence(struct fp_img_dev *idev, int sequence)
+struct data_exchange_async_data_t {
+	struct fpi_ssm *ssm;
+	const struct data_exchange_t *dex;
+};
+
+static void on_data_exchange_response_got_cb(struct fp_img_dev *idev, int status, void *data)
 {
-	return do_data_exchange(idev, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
+	struct data_exchange_async_data_t *dex_data = data;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	if (status == LIBUSB_TRANSFER_COMPLETED &&
+	    check_data_exchange(vdev, dex_data->dex)) {
+		fpi_ssm_next_state(dex_data->ssm);
+	} else {
+		fp_err("Initialization failed at state %d", dex_data->ssm->cur_state);
+		fpi_ssm_mark_aborted(dex_data->ssm, status);
+	}
+
+	g_free(dex_data);
+}
+
+static void on_data_exchange_message_sent_cb(struct fp_img_dev *idev, int status, void *data)
+{
+	struct data_exchange_async_data_t *dex_data = data;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		async_read_from_usb(idev, FALSE, vdev->buffer,
+				    VFS_USB_BUFFER_SIZE,
+				    on_data_exchange_response_got_cb, dex_data);
+	} else {
+		fp_err("Initialization failed at state %d", dex_data->ssm->cur_state);
+		fpi_ssm_mark_aborted(dex_data->ssm, status);
+		g_free(dex_data);
+	}
+}
+
+static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
+{
+	struct fp_img_dev *idev = ssm->priv;
+	const struct data_exchange_t *dex = &INIT_SEQUENCES[sequence];
+	struct data_exchange_async_data_t *dex_data;
+
+	dex_data = g_new0(struct data_exchange_async_data_t, 1);
+	dex_data->ssm = ssm;
+	dex_data->dex = dex;
+	async_write_to_usb(idev, dex->msg, dex->msg_length,
+			   on_data_exchange_message_sent_cb, dex_data);
 }
 
 static void TLS_PRF2(const unsigned char *secret, int secret_len, char *str,
@@ -1078,14 +1129,8 @@ static void init_ssm(struct fpi_ssm *ssm)
 	case INIT_STATE_SEQ_5:
 	case INIT_STATE_SEQ_6:
 		printf("State %d\n",ssm->cur_state);
+		send_init_sequence(ssm, ssm->cur_state - INIT_STATE_SEQ_1);
 
-		if (send_init_sequence(idev, ssm->cur_state - INIT_STATE_SEQ_1)) {
-			fpi_ssm_next_state(ssm);
-		} else {
-			fp_err("Initialization failed at state %d", ssm->cur_state);
-			fpi_imgdev_session_error(idev, -EIO);
-			fpi_ssm_mark_aborted(ssm, -EIO);
-		}
 		break;
 
 	case INIT_STATE_MASTER_KEY:

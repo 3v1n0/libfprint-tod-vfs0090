@@ -587,7 +587,7 @@ struct data_exchange_async_data_t {
 	const struct data_exchange_t *dex;
 };
 
-static void on_data_exchange_response_got_cb(struct fp_img_dev *idev, int status, void *data)
+static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 {
 	struct data_exchange_async_data_t *dex_data = data;
 	struct vfs_dev_t *vdev = idev->priv;
@@ -597,39 +597,27 @@ static void on_data_exchange_response_got_cb(struct fp_img_dev *idev, int status
 		fpi_ssm_next_state(dex_data->ssm);
 	} else {
 		fp_err("Initialization failed at state %d", dex_data->ssm->cur_state);
+		fpi_imgdev_session_error(idev, -EIO);
 		fpi_ssm_mark_aborted(dex_data->ssm, status);
 	}
 
 	g_free(dex_data);
 }
 
-static void on_data_exchange_message_sent_cb(struct fp_img_dev *idev, int status, void *data)
-{
-	struct data_exchange_async_data_t *dex_data = data;
-	struct vfs_dev_t *vdev = idev->priv;
-
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
-		async_read_from_usb(idev, FALSE, vdev->buffer,
-				    VFS_USB_BUFFER_SIZE,
-				    on_data_exchange_response_got_cb, dex_data);
-	} else {
-		fp_err("Initialization failed at state %d", dex_data->ssm->cur_state);
-		fpi_ssm_mark_aborted(dex_data->ssm, status);
-		g_free(dex_data);
-	}
-}
-
 static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
 {
 	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_dev_t *vdev = idev->priv;
 	const struct data_exchange_t *dex = &INIT_SEQUENCES[sequence];
 	struct data_exchange_async_data_t *dex_data;
 
 	dex_data = g_new0(struct data_exchange_async_data_t, 1);
 	dex_data->ssm = ssm;
 	dex_data->dex = dex;
-	async_write_to_usb(idev, dex->msg, dex->msg_length,
-			   on_data_exchange_message_sent_cb, dex_data);
+
+	async_data_exchange(idev, dex->msg, dex->msg_length,
+			    vdev->buffer, VFS_USB_BUFFER_SIZE,
+			    on_data_exchange_cb, dex_data);
 }
 
 static void TLS_PRF2(const unsigned char *secret, int secret_len, char *str,

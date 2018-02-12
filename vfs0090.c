@@ -327,9 +327,11 @@ static void async_read_decrypt_from_usb(struct fp_img_dev *idev, gboolean interr
 
 struct async_data_exchange_t {
 	async_operation_cb callback;
+	void* callback_data;
+
+	int exchange_mode;
 	unsigned char *buffer;
 	int buffer_size;
-	void* callback_data;
 };
 
 static void on_async_data_exchange_cb(struct fp_img_dev *idev,
@@ -338,8 +340,18 @@ static void on_async_data_exchange_cb(struct fp_img_dev *idev,
 	struct async_data_exchange_t *dex = data;
 
 	if (status == LIBUSB_TRANSFER_COMPLETED) {
-		async_read_from_usb(idev, FALSE, dex->buffer, dex->buffer_size,
-				    dex->callback, dex->callback_data);
+		if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
+			async_read_from_usb(idev, FALSE,
+					    dex->buffer,
+					    dex->buffer_size,
+					    dex->callback, dex->callback_data);
+		} else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED) {
+			async_read_decrypt_from_usb(idev, FALSE,
+						    dex->buffer,
+						    dex->buffer_size,
+						    dex->callback,
+						    dex->callback_data);
+		}
 	} else if (dex->callback) {
 		dex->callback(idev, status, dex->callback_data);
 	}
@@ -347,7 +359,7 @@ static void on_async_data_exchange_cb(struct fp_img_dev *idev,
 	g_free(dex);
 }
 
-static void async_data_exchange(struct fp_img_dev *idev,
+static void async_data_exchange(struct fp_img_dev *idev, int exchange_mode,
 				const unsigned char *data, int data_size,
 				unsigned char *buffer, int buffer_size,
 				async_operation_cb callback, void* callback_data)
@@ -359,8 +371,18 @@ static void async_data_exchange(struct fp_img_dev *idev,
 	dex->buffer_size = buffer_size;
 	dex->callback = callback;
 	dex->callback_data = callback_data;
+	dex->exchange_mode = exchange_mode;
 
-	async_write_to_usb(idev, data, data_size, on_async_data_exchange_cb, dex);
+	if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
+		async_write_to_usb(idev, data, data_size,
+				   on_async_data_exchange_cb, dex);
+	} else if (dex->exchange_mode) {
+		async_write_encrypted_to_usb(idev, data, data_size,
+					     on_async_data_exchange_cb, dex);
+	} else {
+		fp_err("Unknown exchange mode selected\n");
+		fpi_imgdev_session_error(idev, -EIO);
+	}
 }
 
 static void async_transfer_callback_with_ssm(struct fp_img_dev *idev,
@@ -567,6 +589,7 @@ static unsigned char *tls_encrypt(struct fp_img_dev *idev,
 	int res_len;
 
 	vdev = idev->priv;
+	g_assert(vdev->key_block);
 
 	mac_then_encrypt(0x17, vdev->key_block, data, data_size, &res, &res_len);
 
@@ -603,6 +626,8 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 	const unsigned char *buff = buffer + 5;
 	gboolean ret = FALSE;
 	*output_len = 0;
+
+	g_assert(vdev->key_block);
 
 	EVP_CIPHER_CTX *context = EVP_CIPHER_CTX_new();
 	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vdev->key_block + 0x60, buff)) {
@@ -672,7 +697,7 @@ static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_ex
 	return TRUE;
 }
 
-static gboolean do_data_exchange(struct fp_img_dev *idev, const struct data_exchange_t *dex, int mode)
+static gboolean do_data_exchange_sync(struct fp_img_dev *idev, const struct data_exchange_t *dex, int mode)
 {
 	struct vfs_dev_t *vdev = idev->priv;
 
@@ -729,20 +754,24 @@ static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 	g_free(dex_data);
 }
 
-static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
+static void do_data_exchange(struct fpi_ssm *ssm, const struct data_exchange_t *dex, int mode)
 {
 	struct fp_img_dev *idev = ssm->priv;
 	struct vfs_dev_t *vdev = idev->priv;
-	const struct data_exchange_t *dex = &INIT_SEQUENCES[sequence];
 	struct data_exchange_async_data_t *dex_data;
 
 	dex_data = g_new0(struct data_exchange_async_data_t, 1);
 	dex_data->ssm = ssm;
 	dex_data->dex = dex;
 
-	async_data_exchange(idev, dex->msg, dex->msg_length,
+	async_data_exchange(idev, mode, dex->msg, dex->msg_length,
 			    vdev->buffer, VFS_USB_BUFFER_SIZE,
 			    on_data_exchange_cb, dex_data);
+}
+
+static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
+{
+	do_data_exchange(ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
 }
 
 static void TLS_PRF2(const unsigned char *secret, int secret_len, char *str,
@@ -978,7 +1007,8 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		puts("Sending Client hello");
 		print_hex(client_hello, sizeof(TLS_CLIENT_HELLO));
 
-		async_data_exchange(idev, client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
+		async_data_exchange(idev, DATA_EXCHANGE_PLAIN,
+				    client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
 				    tlshd->read_buffer, sizeof(tlshd->read_buffer),
 				    async_transfer_callback_with_ssm, ssm);
 
@@ -1120,7 +1150,8 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 	}
 	case TLS_HANDSHAKE_STATE_SEND_CERT:
 	{
-		async_data_exchange(idev, vdev->tls_certificate,
+		async_data_exchange(idev, DATA_EXCHANGE_PLAIN,
+				    vdev->tls_certificate,
 				    sizeof(vdev->tls_certificate),
 				    tlshd->read_buffer, VFS_USB_BUFFER_SIZE,
 				    async_transfer_callback_with_ssm, ssm);
@@ -1660,9 +1691,9 @@ static void dev_activate_callback(struct fpi_ssm *ssm)
 	fpi_ssm_free(ssm);
 }
 
-static gboolean send_activate_sequence(struct fp_img_dev *idev, int sequence)
+static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequence)
 {
-	return do_data_exchange(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+	return do_data_exchange_sync(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
 static void activate_ssm(struct fpi_ssm *ssm)
@@ -1682,7 +1713,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	case ACTIVATE_STATE_SCAN_MATRIX2:
 		printf("Activate State %d\n",ssm->cur_state);
 
-		if (send_activate_sequence(idev, ssm->cur_state - INIT_STATE_SEQ_1)) {
+		if (send_activate_sequence_sync(idev, ssm->cur_state - INIT_STATE_SEQ_1)) {
 			fpi_ssm_next_state(ssm);
 		} else {
 			fp_err("Activation failed failed at state %d", ssm->cur_state);

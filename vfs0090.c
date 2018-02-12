@@ -1426,8 +1426,9 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 	const unsigned char scan_completed[] = { 0x03, 0x41, 0x03, 0x00, 0x40 };
 
 	const unsigned char desired_interrupt[] = { 0x03, 0x43, 0x04, 0x00, 0x41 };
-	const unsigned char other_scan_interrupt[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
+	const unsigned char low_quality_scan_interrupt[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
 	const unsigned char scan_failed_too_short_interrupt[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
+	const unsigned char scan_failed_too_short2_interrupt[] = { 0x03, 0x61, 0x07, 0x00, 0x41 };
 	const unsigned char scan_failed_too_fast_interrupt[] = { 0x03, 0x20, 0x07, 0x00, 0x00 };
 
 	if (sizeof(waiting_finger) == interrupt_size &&
@@ -1462,8 +1463,8 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 		return VFS_SCAN_SUCCESS;
 	}
 
-	if (sizeof(other_scan_interrupt) == interrupt_size &&
-	    memcmp(other_scan_interrupt, interrupt, interrupt_size) == 0) {
+	if (sizeof(low_quality_scan_interrupt) == interrupt_size &&
+	    memcmp(low_quality_scan_interrupt, interrupt, interrupt_size) == 0) {
 		printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
 		return VFS_SCAN_SUCCESS_LOW_QUALITY;
 	}
@@ -1471,6 +1472,12 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 	if (sizeof(scan_failed_too_short_interrupt) == interrupt_size &&
 	    memcmp(scan_failed_too_short_interrupt, interrupt, interrupt_size) == 0) {
 		fp_err("Impossible to read fingerprint, don't move your finger");
+		return VFS_SCAN_FAILED_TOO_SHORT;
+	}
+
+	if (sizeof(scan_failed_too_short2_interrupt) == interrupt_size &&
+	    memcmp(scan_failed_too_short2_interrupt, interrupt, interrupt_size) == 0) {
+		fp_err("Impossible to read fingerprint, don't move your finger (2)");
 		return VFS_SCAN_FAILED_TOO_SHORT;
 	}
 

@@ -1684,6 +1684,12 @@ static void dev_activate_callback(struct fpi_ssm *ssm)
 	struct fp_img_dev *idev = ssm->priv;
 	struct vfs_dev_t *vdev = idev->priv;
 
+	if (ssm->error) {
+		fp_err("Activation failed failed at state %d, unexpected"
+		       "device reply during initialization", ssm->cur_state);
+		fpi_imgdev_session_error(idev, ssm->error);
+	}
+
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
@@ -1694,6 +1700,11 @@ static void dev_activate_callback(struct fpi_ssm *ssm)
 static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequence)
 {
 	return do_data_exchange_sync(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+}
+
+static void send_activate_sequence(struct fpi_ssm *ssm, struct fp_img_dev *idev, int sequence)
+{
+	do_data_exchange(ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
 static void activate_ssm(struct fpi_ssm *ssm)
@@ -1711,14 +1722,8 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	case ACTIVATE_STATE_SEQ_7:
 	case ACTIVATE_STATE_SCAN_MATRIX:
 		printf("Activate State %d\n",ssm->cur_state);
+		send_activate_sequence(ssm, idev, ssm->cur_state - ACTIVATE_STATE_SEQ_1);
 
-		if (send_activate_sequence_sync(idev, ssm->cur_state - INIT_STATE_SEQ_1)) {
-			fpi_ssm_next_state(ssm);
-		} else {
-			fp_err("Activation failed failed at state %d", ssm->cur_state);
-			fpi_imgdev_session_error(idev, -EIO);
-			fpi_ssm_mark_aborted(ssm, -EIO);
-		}
 		break;
 
 	case ACTIVATE_STATE_WAIT_DEVICE:

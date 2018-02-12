@@ -106,6 +106,13 @@ void print_hex(unsigned char *data, int len) {
 
 /* remove emmmeeme */
 
+static unsigned char *tls_encrypt(struct fp_img_dev *idev,
+				  const unsigned char *data, int data_size,
+				  int *encrypted_len_out);
+static gboolean tls_decrypt(struct fp_img_dev *idev,
+			    const unsigned char *buffer, int buffer_size,
+			    unsigned char *output_buffer, int *output_len);
+
 typedef void (*async_operation_cb)(struct fp_img_dev *idev, int status, void *data);
 
 struct async_usb_operation_data_t {
@@ -236,6 +243,86 @@ static void async_read_from_usb(struct fp_img_dev *idev, gboolean interrupt,
 					  VFS_USB_TIMEOUT);
 
 	libusb_submit_transfer(vdev->transfer);
+}
+
+struct async_usb_encrypted_operation_data_t {
+	async_operation_cb callback;
+	void *callback_data;
+
+	unsigned char *encrypted_data;
+	int encrypted_data_size;
+};
+
+static void async_write_encrypted_callback(struct fp_img_dev *idev, int status, void *data)
+{
+	struct async_usb_encrypted_operation_data_t *enc_op = data;
+
+	if (enc_op->callback)
+		enc_op->callback(idev, status, enc_op->callback_data);
+
+	free(enc_op->encrypted_data);
+	free(enc_op);
+}
+
+static void async_write_encrypted_to_usb(struct fp_img_dev *idev,
+					const unsigned char *data, int data_size,
+					async_operation_cb callback, void* callback_data)
+{
+	struct async_usb_encrypted_operation_data_t *enc_op;
+	unsigned char *encrypted_data;
+	int encrypted_data_size;
+
+	encrypted_data = tls_encrypt(idev, data, data_size,
+				     &encrypted_data_size);
+
+	enc_op = g_new0(struct async_usb_encrypted_operation_data_t, 1);
+	enc_op->callback = callback;
+	enc_op->callback_data = callback_data;
+	enc_op->encrypted_data = encrypted_data;
+	enc_op->encrypted_data_size = encrypted_data_size;
+
+	async_write_to_usb(idev, encrypted_data, encrypted_data_size,
+			   async_write_encrypted_callback, enc_op);
+}
+
+static void async_read_encrypted_callback(struct fp_img_dev *idev, int status, void *data)
+{
+	struct async_usb_encrypted_operation_data_t *enc_op = data;
+	struct vfs_dev_t *vdev = idev->priv;
+	unsigned char decrypted_data[VFS_USB_BUFFER_SIZE];
+	int decrypted_data_size;
+
+	if (status == LIBUSB_TRANSFER_COMPLETED &&
+	    !tls_decrypt(idev, vdev->buffer, vdev->buffer_length,
+			 decrypted_data, &decrypted_data_size)) {
+		status = LIBUSB_TRANSFER_ERROR;
+	}
+
+	g_free(vdev->buffer);
+	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
+	vdev->buffer_length = decrypted_data_size;
+
+	memcpy(vdev->buffer, decrypted_data, decrypted_data_size);
+
+	if (enc_op->callback)
+		enc_op->callback(idev, status, enc_op->callback_data);
+
+	free(enc_op->encrypted_data);
+	free(enc_op);
+}
+
+static void async_read_decrypt_from_usb(struct fp_img_dev *idev, gboolean interrupt,
+					unsigned char *buffer, int buffer_size,
+					async_operation_cb callback, void* callback_data)
+{
+	struct async_usb_encrypted_operation_data_t *enc_op;
+
+	enc_op = g_new0(struct async_usb_encrypted_operation_data_t, 1);
+	enc_op->callback = callback;
+	enc_op->callback_data = callback_data;
+
+	async_read_from_usb(idev, interrupt, buffer, buffer_size,
+			    async_read_encrypted_callback, enc_op);
 }
 
 struct async_data_exchange_t {

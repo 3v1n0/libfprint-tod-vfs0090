@@ -1417,10 +1417,8 @@ static void fingerprint(struct fp_img_dev *idev) {
     ++number_of_img;
 }
 
-static int wait_for_finger_state(struct fp_img_dev *idev) {
-	unsigned char interrupt[0x100];
-	int interrupt_len;
-
+static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
+{
 	const unsigned char waiting_finger[] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
 	const unsigned char finger_down[] = { 0x02, 0x00, 0x40, 0x10, 0x00 };
 	const unsigned char finger_down2[] = { 0x02, 0x00, 0x40, 0x06, 0x06 };
@@ -1432,6 +1430,68 @@ static int wait_for_finger_state(struct fp_img_dev *idev) {
 	const unsigned char scan_failed_too_short_interrupt[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
 	const unsigned char scan_failed_too_fast_interrupt[] = { 0x03, 0x20, 0x07, 0x00, 0x00 };
 
+	if (sizeof(waiting_finger) == interrupt_size &&
+		memcmp(waiting_finger, interrupt, interrupt_size) == 0) {
+		fp_info("Waiting for finger...");
+		return VFS_SCAN_WAITING_FOR_FINGER;
+	}
+
+	if ((sizeof(finger_down) == interrupt_size &&
+	     memcmp(finger_down, interrupt, interrupt_size) == 0) ||
+	    (sizeof(finger_down2) == interrupt_size &&
+	     memcmp(finger_down2, interrupt, interrupt_size) == 0)) {
+		fp_info("Finger is on the sensor...");
+		return VFS_SCAN_FINGER_ON_SENSOR;
+	}
+
+	if (sizeof(scanning_prints) == interrupt_size &&
+	    memcmp(scanning_prints, interrupt, interrupt_size) == 0) {
+		fp_info("Scan in progress...");
+		return VFS_SCAN_IN_PROGRESS;
+	}
+
+	if (sizeof(scan_completed) == interrupt_size &&
+	    memcmp(scan_completed, interrupt, interrupt_size) == 0) {
+		fp_info("Fingerprint scan completed...");
+		return VFS_SCAN_COMPLETED;
+	}
+
+	if (sizeof(desired_interrupt) == interrupt_size &&
+	    memcmp(desired_interrupt, interrupt, interrupt_size) == 0) {
+		fp_info("Fingerprint scan success...");
+		return VFS_SCAN_SUCCESS;
+	}
+
+	if (sizeof(other_scan_interrupt) == interrupt_size &&
+	    memcmp(other_scan_interrupt, interrupt, interrupt_size) == 0) {
+		printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
+		return VFS_SCAN_SUCCESS_LOW_QUALITY;
+	}
+
+	if (sizeof(scan_failed_too_short_interrupt) == interrupt_size &&
+	    memcmp(scan_failed_too_short_interrupt, interrupt, interrupt_size) == 0) {
+		fp_err("Impossible to read fingerprint, don't move your finger");
+		return VFS_SCAN_FAILED_TOO_SHORT;
+	}
+
+	if (sizeof(scan_failed_too_fast_interrupt) == interrupt_size &&
+	    memcmp(scan_failed_too_fast_interrupt, interrupt, interrupt_size) == 0) {
+		fp_err("Impossible to read fingerprint, movement was too fast");
+		return VFS_SCAN_FAILED_TOO_FAST;
+	}
+
+	fp_err("Interrupt not tracked, please report!");
+	print_hex(interrupt, interrupt_size);
+
+	return VFS_SCAN_UNKNOWN;
+}
+
+
+static int wait_for_finger_state(struct fp_img_dev *idev) {
+	unsigned char interrupt[0x100] = {};
+	int interrupt_len;
+
+
 	g_print("Wait for wait_for_finger_state, state is %d\n",idev->action_state);
 	while (TRUE) {
 		int status = libusb_interrupt_transfer(idev->udev, 0x83, interrupt, 0x100, &interrupt_len, 5 * 1000);
@@ -1440,61 +1500,11 @@ static int wait_for_finger_state(struct fp_img_dev *idev) {
 			print_hex(interrupt, interrupt_len);
 			fflush(stdout);
 
-			if (sizeof(waiting_finger) == interrupt_len &&
-			    memcmp(waiting_finger, interrupt, interrupt_len) == 0) {
-				fp_info("Waiting for finger...");
-				return VFS_SCAN_WAITING_FOR_FINGER;
-			}
-			if ((sizeof(finger_down) == interrupt_len &&
-			     memcmp(finger_down, interrupt, interrupt_len) == 0) ||
-			    (sizeof(finger_down2) == interrupt_len &&
-			     memcmp(finger_down2, interrupt, interrupt_len) == 0)) {
-				fp_info("Finger is on the sensor...");
-				return VFS_SCAN_FINGER_ON_SENSOR;
-			}
-			if (sizeof(scanning_prints) == interrupt_len &&
-			    memcmp(scanning_prints, interrupt, interrupt_len) == 0) {
-				fp_info("Scan in progress...");
-				return VFS_SCAN_IN_PROGRESS;
-			}
-			if (sizeof(scan_completed) == interrupt_len &&
-			    memcmp(scan_completed, interrupt, interrupt_len) == 0) {
-				fp_info("Fingerprint scan completed...");
-				return VFS_SCAN_COMPLETED;
-			}
-			if (sizeof(desired_interrupt) == interrupt_len &&
-			    memcmp(desired_interrupt, interrupt, interrupt_len) == 0) {
-				return VFS_SCAN_SUCCESS;
-				// fpi_imgdev_report_finger_status(idev, FALSE);
-				// break;
-			}
-			if (sizeof(other_scan_interrupt) == interrupt_len &&
-			    memcmp(other_scan_interrupt, interrupt, interrupt_len) == 0) {
-				printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
-				return VFS_SCAN_SUCCESS_LOW_QUALITY;
-				// fpi_imgdev_report_finger_status(idev, FALSE);
-				// break;
-			}
-			if (sizeof(scan_failed_too_short_interrupt) == interrupt_len &&
-			    memcmp(scan_failed_too_short_interrupt, interrupt, interrupt_len) == 0) {
-				fp_err("Impossible to read fingerprint, don't move your finger");
-				return VFS_SCAN_FAILED_TOO_SHORT;
-				// fpi_imgdev_report_finger_status(idev, FALSE);
-				// fpi_ssm_mark_aborted(ssm, -EIO);
-				// return;
-			}
-			if (sizeof(scan_failed_too_fast_interrupt) == interrupt_len &&
-			    memcmp(scan_failed_too_fast_interrupt, interrupt, interrupt_len) == 0) {
-				fp_err("Impossible to read fingerprint, movement was too fast");
-				return VFS_SCAN_FAILED_TOO_FAST;
-				// fpi_imgdev_report_finger_status(idev, FALSE);
-				// fpi_ssm_mark_aborted(ssm, -EIO);
-				// return;
-			}
+			return translate_interrupt(interrupt, interrupt_len);
 		}
 	}
 
-	return VFS_SCAN_OTHER;
+	return VFS_SCAN_UNKNOWN;
 }
 
 static void save_image(struct fp_img_dev *idev)

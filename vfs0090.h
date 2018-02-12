@@ -84,16 +84,21 @@ enum VFS_SCAN_INTERRUPTS {
 	VFS_SCAN_OTHER,
 };
 
-struct data_exchange_t {
-	const unsigned char *msg;
-	int                  msg_length;
-	const unsigned char *rsp;
-	int                  rsp_length;
+enum VFS_READ_MODE {
+	VFS_READ_BULK,
+	VFS_READ_INTERRUPT,
 };
 
 enum DATA_EXCHANGE_MODE {
 	DATA_EXCHANGE_PLAIN,
 	DATA_EXCHANGE_ENCRYPTED,
+};
+
+struct data_exchange_t {
+	const unsigned char *msg;
+	int                  msg_length;
+	const unsigned char *rsp;
+	int                  rsp_length;
 };
 
 static const unsigned char INIT_SEQUENCE_MSG1[] = { 0x01 };

@@ -214,7 +214,7 @@ out:
 	g_free(op_data);
 }
 
-static void async_read_from_usb(struct fp_img_dev *idev, gboolean interrupt,
+static void async_read_from_usb(struct fp_img_dev *idev, int read_mode,
 				unsigned char *buffer, int buffer_size,
 				async_operation_cb callback, void* callback_data)
 {
@@ -231,16 +231,18 @@ static void async_read_from_usb(struct fp_img_dev *idev, gboolean interrupt,
 	op_data->callback = callback;
 	op_data->callback_data = callback_data;
 
-	if (interrupt)
+	if (read_mode == VFS_READ_INTERRUPT)
 		libusb_fill_interrupt_transfer(vdev->transfer, idev->udev, 0x83,
 					       buffer, buffer_size,
 					       async_read_callback, op_data,
 					       VFS_USB_TIMEOUT);
-	else
+	else if (read_mode == VFS_READ_BULK)
 		libusb_fill_bulk_transfer(vdev->transfer, idev->udev, 0x81,
 					  buffer, buffer_size,
 					  async_read_callback, op_data,
 					  VFS_USB_TIMEOUT);
+	else
+		g_assert_not_reached();
 
 	libusb_submit_transfer(vdev->transfer);
 }
@@ -311,7 +313,7 @@ static void async_read_encrypted_callback(struct fp_img_dev *idev, int status, v
 	free(enc_op);
 }
 
-static void async_read_decrypt_from_usb(struct fp_img_dev *idev, gboolean interrupt,
+static void async_read_decrypt_from_usb(struct fp_img_dev *idev, int read_mode,
 					unsigned char *buffer, int buffer_size,
 					async_operation_cb callback, void* callback_data)
 {
@@ -321,7 +323,7 @@ static void async_read_decrypt_from_usb(struct fp_img_dev *idev, gboolean interr
 	enc_op->callback = callback;
 	enc_op->callback_data = callback_data;
 
-	async_read_from_usb(idev, interrupt, buffer, buffer_size,
+	async_read_from_usb(idev, read_mode, buffer, buffer_size,
 			    async_read_encrypted_callback, enc_op);
 }
 
@@ -341,12 +343,12 @@ static void on_async_data_exchange_cb(struct fp_img_dev *idev,
 
 	if (status == LIBUSB_TRANSFER_COMPLETED) {
 		if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
-			async_read_from_usb(idev, FALSE,
+			async_read_from_usb(idev, VFS_READ_BULK,
 					    dex->buffer,
 					    dex->buffer_size,
 					    dex->callback, dex->callback_data);
 		} else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED) {
-			async_read_decrypt_from_usb(idev, FALSE,
+			async_read_decrypt_from_usb(idev, VFS_READ_BULK,
 						    dex->buffer,
 						    dex->buffer_size,
 						    dex->callback,

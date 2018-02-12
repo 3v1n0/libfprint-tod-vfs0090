@@ -231,18 +231,22 @@ static void async_read_from_usb(struct fp_img_dev *idev, int read_mode,
 	op_data->callback = callback;
 	op_data->callback_data = callback_data;
 
-	if (read_mode == VFS_READ_INTERRUPT)
+	switch (read_mode) {
+	case VFS_READ_INTERRUPT:
 		libusb_fill_interrupt_transfer(vdev->transfer, idev->udev, 0x83,
 					       buffer, buffer_size,
 					       async_read_callback, op_data,
-					       VFS_USB_TIMEOUT);
-	else if (read_mode == VFS_READ_BULK)
+					       VFS_USB_INTERRUPT_TIMEOUT);
+		break;
+	case VFS_READ_BULK:
 		libusb_fill_bulk_transfer(vdev->transfer, idev->udev, 0x81,
 					  buffer, buffer_size,
 					  async_read_callback, op_data,
 					  VFS_USB_TIMEOUT);
-	else
+		break;
+	default:
 		g_assert_not_reached();
+	}
 
 	libusb_submit_transfer(vdev->transfer);
 }

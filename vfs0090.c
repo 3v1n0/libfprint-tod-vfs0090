@@ -752,7 +752,7 @@ static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 	    check_data_exchange(vdev, dex_data->dex)) {
 		fpi_ssm_next_state(dex_data->ssm);
 	} else {
-		fp_err("Initialization failed at state %d", dex_data->ssm->cur_state);
+		fp_err("Data exchange failed at state %d", dex_data->ssm->cur_state);
 		fpi_imgdev_session_error(idev, -EIO);
 		fpi_ssm_mark_aborted(dex_data->ssm, status);
 	}
@@ -1632,9 +1632,11 @@ static void init_ssm(struct fpi_ssm *ssm)
 		fpi_ssm_next_state(ssm);
 		break;
 	}
+
 	case INIT_STATE_HANDSHAKE:
 		start_handshake_ssm(idev, ssm);
 		break;
+
 	default:
 		fp_err("Unknown state");
 		fpi_imgdev_session_error(idev, -EIO);
@@ -1707,6 +1709,154 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	return 0;
 }
 
+static void finger_scan_callback(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	if (ssm->error) {
+		fp_err("Scan failed failed at state %d, unexpected"
+		       "device reply during initialization", ssm->cur_state);
+		fpi_imgdev_session_error(idev, ssm->error);
+	}
+
+	vdev->buffer_length = 0;
+	g_clear_pointer(&vdev->buffer, g_free);
+	fpi_ssm_free(ssm);
+}
+
+static void finger_scan_interrupt_callback(struct fp_img_dev *idev, int status, void *data)
+{
+	struct vfs_dev_t *vdev = idev->priv;
+	struct fpi_ssm *ssm = data;
+	int interrupt_type;
+
+	interrupt_type = translate_interrupt(vdev->buffer, vdev->buffer_length);
+	g_print("INTERRUPT CALLBACK (finger_scan_interrupt_callback) %d, type %d\n",
+	        status, interrupt_type);
+	print_hex(vdev->buffer, vdev->buffer_length);
+	fpi_ssm_jump_to_state(ssm, interrupt_type);
+}
+
+static void finger_scan_ssm(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	switch (ssm->cur_state) {
+	case SCAN_STATE_FINGER_ON_SENSOR:
+		fpi_imgdev_report_finger_status(idev, TRUE);
+
+	case SCAN_STATE_WAITING_FOR_FINGER:
+	case SCAN_STATE_IN_PROGRESS:
+	case SCAN_STATE_COMPLETED:
+		async_read_from_usb(idev, VFS_READ_INTERRUPT,
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    finger_scan_interrupt_callback, ssm);
+
+		break;
+
+	case SCAN_STATE_FAILED_TOO_SHORT:
+	case SCAN_STATE_FAILED_TOO_FAST:
+		fpi_imgdev_abort_scan(idev, FP_CAPTURE_FAIL);
+		fpi_imgdev_report_finger_status(idev, FALSE);
+
+		/* We could actually retrying again by going back to
+		 * ACTIVATE_STATE_SEQ_1, that would need to split the
+		 * SSMs though, to repeat the activation states again
+		 * without informing the driver */
+
+		break;
+
+	case SCAN_STATE_SUCCESS:
+	case SCAN_STATE_SUCCESS_LOW_QUALITY:
+		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");
+		save_image(idev);
+		fpi_imgdev_report_finger_status(idev, FALSE);
+		fpi_ssm_mark_completed(ssm);
+		break;
+
+	default:
+		fp_err("Unknown scan state");
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+	}
+}
+
+static void start_finger_scan(struct fp_img_dev *idev)
+{
+	struct vfs_dev_t *vdev = idev->priv;
+	struct fpi_ssm *ssm;
+
+	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
+	vdev->buffer_length = 0;
+
+	ssm = fpi_ssm_new(idev->dev, finger_scan_ssm, SCAN_STATE_LAST);
+	ssm->priv = idev;
+	fpi_ssm_start(ssm, finger_scan_callback);
+
+	return 0;
+}
+
+static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequence)
+{
+	return do_data_exchange_sync(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+}
+
+static void send_activate_sequence(struct fpi_ssm *ssm, struct fp_img_dev *idev, int sequence)
+{
+	do_data_exchange(ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+}
+
+static void activate_device_interrupt_callback(struct fp_img_dev *idev, int status, void *data)
+{
+	struct vfs_dev_t *vdev = idev->priv;
+	struct fpi_ssm *ssm = data;
+	int interrupt_type;
+
+	interrupt_type = translate_interrupt(vdev->buffer, vdev->buffer_length);
+
+	if (interrupt_type == VFS_SCAN_WAITING_FOR_FINGER) {
+		fpi_ssm_next_state(ssm);
+	} else {
+		fp_err("Unexpected device interrupt (%d) at this state",
+		       interrupt_type);
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+	}
+}
+
+static void activate_ssm(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	switch (ssm->cur_state) {
+	case ACTIVATE_STATE_SEQ_1:
+	case ACTIVATE_STATE_SEQ_2:
+	case ACTIVATE_STATE_SEQ_3:
+	case ACTIVATE_STATE_SEQ_4:
+	case ACTIVATE_STATE_SEQ_5:
+	case ACTIVATE_STATE_SEQ_6:
+	case ACTIVATE_STATE_SEQ_7:
+	case ACTIVATE_STATE_SCAN_MATRIX:
+		printf("Activate State %d\n",ssm->cur_state);
+		send_activate_sequence(ssm, idev, ssm->cur_state - ACTIVATE_STATE_SEQ_1);
+		break;
+
+	case ACTIVATE_STATE_WAIT_DEVICE:
+		async_read_from_usb(idev, VFS_READ_INTERRUPT,
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    activate_device_interrupt_callback, ssm);
+		break;
+
+	default:
+		fp_err("Unknown state");
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+	}
+}
+
 /* Callback for dev_activate ssm */
 static void dev_activate_callback(struct fpi_ssm *ssm)
 {
@@ -1723,55 +1873,11 @@ static void dev_activate_callback(struct fpi_ssm *ssm)
 	vdev->buffer_length = 0;
 
 	fpi_imgdev_activate_complete(idev, ssm->error);
+
+	if (!ssm->error)
+		start_finger_scan(idev);
+
 	fpi_ssm_free(ssm);
-}
-
-static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequence)
-{
-	return do_data_exchange_sync(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
-}
-
-static void send_activate_sequence(struct fpi_ssm *ssm, struct fp_img_dev *idev, int sequence)
-{
-	do_data_exchange(ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
-}
-
-static void activate_ssm(struct fpi_ssm *ssm)
-{
-	struct fp_img_dev *idev = ssm->priv;
-	// struct vfs_dev_t *vdev = idev->priv;
-
-	switch (ssm->cur_state) {
-	case ACTIVATE_STATE_SEQ_1:
-	case ACTIVATE_STATE_SEQ_2:
-	case ACTIVATE_STATE_SEQ_3:
-	case ACTIVATE_STATE_SEQ_4:
-	case ACTIVATE_STATE_SEQ_5:
-	case ACTIVATE_STATE_SEQ_6:
-	case ACTIVATE_STATE_SEQ_7:
-	case ACTIVATE_STATE_SCAN_MATRIX:
-		printf("Activate State %d\n",ssm->cur_state);
-		send_activate_sequence(ssm, idev, ssm->cur_state - ACTIVATE_STATE_SEQ_1);
-
-		break;
-
-	case ACTIVATE_STATE_WAIT_DEVICE:
-		if (wait_for_finger_state(idev) == VFS_SCAN_WAITING_FOR_FINGER) {
-			fpi_ssm_next_state(ssm);
-		} else {
-			fp_err("Activation failed failed at state %d, unexpected"
-			       "device reply during initialization", ssm->cur_state);
-			fpi_imgdev_session_error(idev, -EIO);
-			fpi_ssm_mark_aborted(ssm, -EIO);
-		}
-
-		break;
-
-	default:
-		fp_err("Unknown state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_aborted(ssm, -EIO);
-	}
 }
 
 static int dev_activate(struct fp_img_dev *idev, enum fp_imgdev_state state)
@@ -1792,52 +1898,20 @@ static int dev_activate(struct fp_img_dev *idev, enum fp_imgdev_state state)
 
 static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state)
 {
-	int finger_state;
 	printf("DEV STATE CHANGE TO %d\n",state);
-
-	switch (state) {
-	case IMGDEV_STATE_INACTIVE:
-		g_print("IMGDEV_STATE_INACTIVE\n");
-		break;
-	case IMGDEV_STATE_AWAIT_FINGER_ON:
-		g_print("IMGDEV_STATE_AWAIT_FINGER_ON\n");
-		while (TRUE) {
-			finger_state = wait_for_finger_state(idev);
-
-			if (finger_state == VFS_SCAN_FINGER_ON_SENSOR) {
-				fpi_imgdev_report_finger_status(idev, TRUE);
-				break;
-			}
-		}
-		break;
-
-	case IMGDEV_STATE_AWAIT_FINGER_OFF:
-		g_print("IMGDEV_STATE_AWAIT_FINGER_OFF\n");
-		break;
-	case IMGDEV_STATE_CAPTURE:
-		g_print("IMGDEV_STATE_CAPTURE\n");
-		while (TRUE) {
-			finger_state = wait_for_finger_state(idev);
-
-			if (finger_state == VFS_SCAN_FAILED_TOO_FAST ||
-			    finger_state == VFS_SCAN_FAILED_TOO_SHORT) {
-				fpi_imgdev_abort_scan(idev, FP_VERIFY_RETRY_TOO_SHORT);
-				// fpi_imgdev_abort_scan(idev, FP_VERIFY_RETRY_CENTER_FINGER);
-				// fpi_imgdev_abort_scan(dev, FP_VERIFY_RETRY); // other errors
-				fpi_imgdev_report_finger_status(idev, FALSE);
-				break;
-			} else if (finger_state == VFS_SCAN_SUCCESS ||
-				   finger_state == VFS_SCAN_SUCCESS_LOW_QUALITY)
-			{
-				save_image(idev);
-				fpi_imgdev_report_finger_status(idev, FALSE);
-				break;
-			}
-		}
-		break;
-	default:
-		fp_err("unrecognised state %d", state);
-		return -EINVAL;
+	switch(state) {
+		case IMGDEV_STATE_INACTIVE:
+			printf("State change: IMGDEV_STATE_INACTIVE\n");
+			break;
+		case IMGDEV_STATE_AWAIT_FINGER_ON:
+			printf("State change: IMGDEV_STATE_AWAIT_FINGER_ON\n");
+			break;
+		case IMGDEV_STATE_CAPTURE:
+			printf("State change: IMGDEV_STATE_CAPTURE\n");
+			break;
+		case IMGDEV_STATE_AWAIT_FINGER_OFF:
+			printf("State change: IMGDEV_STATE_AWAIT_FINGER_OFF\n");
+			break;
 	}
 
 	return 0;

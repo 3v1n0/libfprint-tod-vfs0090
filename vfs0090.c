@@ -1845,7 +1845,12 @@ static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state)
 
 static void dev_deactivate(struct fp_img_dev *idev)
 {
-	// g_clear_pointer(&vdev->buffer, g_free);
+	struct vfs_dev_t *vdev = idev->priv;
+
+	g_clear_pointer(&vdev->buffer, g_free);
+	vdev->buffer_length = 0;
+
+	fpi_imgdev_deactivate_complete(idev);
 }
 
 static void dev_close(struct fp_img_dev *idev)

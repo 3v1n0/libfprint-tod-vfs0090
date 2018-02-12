@@ -1709,8 +1709,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	case ACTIVATE_STATE_SEQ_5:
 	case ACTIVATE_STATE_SEQ_6:
 	case ACTIVATE_STATE_SEQ_7:
-	case ACTIVATE_STATE_SCAN_MATRIX1:
-	case ACTIVATE_STATE_SCAN_MATRIX2:
+	case ACTIVATE_STATE_SCAN_MATRIX:
 		printf("Activate State %d\n",ssm->cur_state);
 
 		if (send_activate_sequence_sync(idev, ssm->cur_state - INIT_STATE_SEQ_1)) {

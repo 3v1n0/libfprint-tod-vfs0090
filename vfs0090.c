@@ -39,13 +39,6 @@
 
 /* The main driver structure */
 struct vfs_dev_t {
-	unsigned char *main_seed;
-	unsigned int main_seed_length;
-
-	unsigned char pubkey[VFS_PUBLIC_KEY_SIZE];
-	unsigned char ecdsa_private_key[VFS_ECDSA_PRIVATE_KEY_SIZE];
-	unsigned char masterkey_aes[VFS_MASTER_KEY_SIZE];
-	unsigned char tls_certificate[G_N_ELEMENTS(TLS_CERTIFICATE_BASE)];
 
 	/* Buffer for saving usb data through states */
 	unsigned char *buffer;
@@ -55,6 +48,17 @@ struct vfs_dev_t {
 
 	/* Current async transfer */
 	struct libusb_transfer *transfer;
+};
+
+struct vfs_init_t {
+	struct fp_img_dev *idev;
+
+	unsigned char *main_seed;
+	unsigned int main_seed_length;
+	unsigned char pubkey[VFS_PUBLIC_KEY_SIZE];
+	unsigned char ecdsa_private_key[VFS_ECDSA_PRIVATE_KEY_SIZE];
+	unsigned char masterkey_aes[VFS_MASTER_KEY_SIZE];
+	unsigned char tls_certificate[G_N_ELEMENTS(TLS_CERTIFICATE_BASE)];
 };
 
 /* DEBUGGG */
@@ -404,17 +408,16 @@ static void async_transfer_callback_with_ssm(struct fp_img_dev *idev,
 	}
 }
 
-static void generate_main_seed(struct fp_img_dev *idev) {
-	struct vfs_dev_t *vdev = idev->priv;
+static void generate_main_seed(struct fp_img_dev *idev, struct vfs_init_t *vinit) {
 	char name[NAME_MAX], serial[NAME_MAX];
 	FILE *name_file, *serial_file;
 	int name_len, serial_len;
 
 	/* The decoding doesn't work properly using generated Seeds yet */
 	const unsigned char test_seed[] = "VirtualBox\0" "0";
-	vdev->main_seed = g_malloc(sizeof(test_seed));
-	memcpy(vdev->main_seed, test_seed, sizeof(test_seed));
-	vdev->main_seed_length = sizeof(test_seed);
+	vinit->main_seed = g_malloc(sizeof(test_seed));
+	memcpy(vinit->main_seed, test_seed, sizeof(test_seed));
+	vinit->main_seed_length = sizeof(test_seed);
 	return;
 
 	if (!(name_file = fopen(DMI_PRODUCT_NAME_NODE, "r"))) {
@@ -438,14 +441,14 @@ static void generate_main_seed(struct fp_img_dev *idev) {
 
 	name_len = strlen(name);
 	serial_len = strlen(serial);
-	vdev->main_seed_length = name_len + serial_len + 2;
-	vdev->main_seed = g_malloc0(vdev->main_seed_length);
+	vinit->main_seed_length = name_len + serial_len + 2;
+	vinit->main_seed = g_malloc0(vinit->main_seed_length);
 
-	memcpy(vdev->main_seed, name, name_len + 1);
-	memcpy(vdev->main_seed + name_len + 1, serial, serial_len + 1);
+	memcpy(vinit->main_seed, name, name_len + 1);
+	memcpy(vinit->main_seed + name_len + 1, serial, serial_len + 1);
 
 	printf("Main seed is\n");
-	print_hex(vdev->main_seed, vdev->main_seed_length);
+	print_hex(vinit->main_seed, vinit->main_seed_length);
 
 	fclose(name_file);
 	fclose(serial_file);
@@ -760,9 +763,8 @@ static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 	g_free(dex_data);
 }
 
-static void do_data_exchange(struct fpi_ssm *ssm, const struct data_exchange_t *dex, int mode)
+static void do_data_exchange(struct fp_img_dev *idev, struct fpi_ssm *ssm, const struct data_exchange_t *dex, int mode)
 {
-	struct fp_img_dev *idev = ssm->priv;
 	struct vfs_dev_t *vdev = idev->priv;
 	struct data_exchange_async_data_t *dex_data;
 
@@ -773,11 +775,6 @@ static void do_data_exchange(struct fpi_ssm *ssm, const struct data_exchange_t *
 	async_data_exchange(idev, mode, dex->msg, dex->msg_length,
 			    vdev->buffer, VFS_USB_BUFFER_SIZE,
 			    on_data_exchange_cb, dex_data);
-}
-
-static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
-{
-	do_data_exchange(ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
 }
 
 static void TLS_PRF2(const unsigned char *secret, int secret_len, char *str,
@@ -833,7 +830,7 @@ static void reverse_mem(unsigned char* data, int size)
     }
 }
 
-static gboolean initialize_ecdsa_key(struct vfs_dev_t *vdev, unsigned char *enc_data, int res_len)
+static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *enc_data, int res_len)
 {
 	int tlen1 = 0, tlen2;
 	unsigned char *res = NULL;
@@ -843,7 +840,7 @@ static gboolean initialize_ecdsa_key(struct vfs_dev_t *vdev, unsigned char *enc_
 	ret = FALSE;
 	context = EVP_CIPHER_CTX_new();
 
-	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vdev->masterkey_aes, enc_data)) {
+	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vinit->masterkey_aes, enc_data)) {
 		fp_err("Failed to initialize EVP decrypt, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
 		goto out;
@@ -870,7 +867,7 @@ static gboolean initialize_ecdsa_key(struct vfs_dev_t *vdev, unsigned char *enc_
 
 	puts("Decoded:");
 	print_hex(res, res_len);
-	memcpy(vdev->ecdsa_private_key, res, VFS_ECDSA_PRIVATE_KEY_SIZE);
+	memcpy(vinit->ecdsa_private_key, res, VFS_ECDSA_PRIVATE_KEY_SIZE);
 
 	ret = check_pad(res, res_len);
 out:
@@ -880,22 +877,22 @@ out:
 	return ret;
 }
 
-static gboolean make_ecdsa_key(struct vfs_dev_t *vdev)
+static gboolean make_ecdsa_key(struct vfs_init_t *vinit, unsigned char *data)
 {
-	if (!initialize_ecdsa_key(vdev, vdev->buffer + 0x52, 0x70))
+	if (!initialize_ecdsa_key(vinit, data + 0x52, 0x70))
 		return FALSE;
 
-	memset(vdev->ecdsa_private_key, 0, 0x40);
+	memset(vinit->ecdsa_private_key, 0, 0x40);
 	// 97 doesn't have XY in private key
-	memcpy(vdev->ecdsa_private_key, vdev->buffer + 0x11e, 0x20);
-	reverse_mem(vdev->ecdsa_private_key, 0x20);
+	memcpy(vinit->ecdsa_private_key, data + 0x11e, 0x20);
+	reverse_mem(vinit->ecdsa_private_key, 0x20);
 
-	memcpy(vdev->ecdsa_private_key + 0x20, vdev->buffer + 0x162, 0x20);
-	reverse_mem(vdev->ecdsa_private_key + 0x20, 0x20);
+	memcpy(vinit->ecdsa_private_key + 0x20, data + 0x162, 0x20);
+	reverse_mem(vinit->ecdsa_private_key + 0x20, 0x20);
 
 	// ECDSA key
 	puts("ECDSA key:");
-	print_hex(vdev->ecdsa_private_key, 0x60);
+	print_hex(vinit->ecdsa_private_key, 0x60);
 
 	return TRUE;
 }
@@ -970,6 +967,7 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 struct tls_handshake_t {
 	struct fp_img_dev *idev;
 	struct fpi_ssm *parent_ssm;
+
 	HASHContext *tls_hash_context;
 	HASHContext *tls_hash_context2;
 	unsigned char read_buffer[VFS_USB_BUFFER_SIZE];
@@ -983,6 +981,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 	struct tls_handshake_t *tlshd = ssm->priv;
 	struct fp_img_dev *idev = tlshd->idev;
 	struct vfs_dev_t *vdev = idev->priv;
+	struct vfs_init_t *vinit = tlshd->parent_ssm->priv;
 
 	switch(ssm->cur_state) {
 	case TLS_HANDSHAKE_STATE_CLIENT_HELLO:
@@ -1044,7 +1043,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 			break;
 		}
 
-		if (!(pub_key = load_key(vdev->pubkey, FALSE))) {
+		if (!(pub_key = load_key(vinit->pubkey, FALSE))) {
 			fp_err("Impossible to load private key");
 			fpi_ssm_mark_aborted(ssm, -EIO);
 			break;
@@ -1104,25 +1103,25 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		unsigned char *cert_verify_signature, *final;
 		int len, test_len;
 
-		memcpy(vdev->tls_certificate + 0xce + 4, PRIVKEY, 0x40);
+		memcpy(vinit->tls_certificate + 0xce + 4, PRIVKEY, 0x40);
 
-		HASH_Update(tlshd->tls_hash_context, vdev->tls_certificate + 0x09, 0x109);
-		HASH_Update(tlshd->tls_hash_context2, vdev->tls_certificate + 0x09, 0x109);
+		HASH_Update(tlshd->tls_hash_context, vinit->tls_certificate + 0x09, 0x109);
+		HASH_Update(tlshd->tls_hash_context2, vinit->tls_certificate + 0x09, 0x109);
 
 		HASH_End(tlshd->tls_hash_context, test, &test_len, G_N_ELEMENTS(test));
 		puts("Hash");
 		print_hex(test, 0x20);
 
-		ecdsa_key = load_key(vdev->ecdsa_private_key, TRUE);
+		ecdsa_key = load_key(vinit->ecdsa_private_key, TRUE);
 		cert_verify_signature = sign2(ecdsa_key, test, 0x20);
 
 		printf("\nCert signed: \n");
 		print_hex(cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
-		memcpy(vdev->tls_certificate + 0x09 + 0x109 + 0x04, cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
+		memcpy(vinit->tls_certificate + 0x09 + 0x109 + 0x04, cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
 
 		// encrypted finished
 		unsigned char handshake_messages[0x20]; int len3 = 0x20;
-		HASH_Update(tlshd->tls_hash_context2, vdev->tls_certificate + 0x09 + 0x109, 0x4c);
+		HASH_Update(tlshd->tls_hash_context2, vinit->tls_certificate + 0x09 + 0x109, 0x4c);
 		HASH_End(tlshd->tls_hash_context2, handshake_messages, &len3, 0x20);
 
 		puts("hash of handshake messages");
@@ -1132,7 +1131,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		print_hex(finished_message, 0x10);
 		unsigned char client_finished[0x0c];
 		TLS_PRF2(tlshd->master_secret, 0x30, "client finished", handshake_messages, 0x20,
-			client_finished, G_N_ELEMENTS(client_finished));
+			 client_finished, G_N_ELEMENTS(client_finished));
 		memcpy(finished_message + 0x04, client_finished, G_N_ELEMENTS(client_finished));
 		// copy handshake protocol
 
@@ -1140,7 +1139,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		print_hex(finished_message, 0x10);
 
 		mac_then_encrypt(0x16, vdev->key_block, finished_message, 0x10, &final, &len);
-		memcpy(vdev->tls_certificate + 0x169, final, len);
+		memcpy(vinit->tls_certificate + 0x169, final, len);
 
 		puts("final");
 		print_hex(final, len);
@@ -1157,8 +1156,8 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 	case TLS_HANDSHAKE_STATE_SEND_CERT:
 	{
 		async_data_exchange(idev, DATA_EXCHANGE_PLAIN,
-				    vdev->tls_certificate,
-				    sizeof(vdev->tls_certificate),
+				    vinit->tls_certificate,
+				    sizeof(vinit->tls_certificate),
 				    tlshd->read_buffer, VFS_USB_BUFFER_SIZE,
 				    async_transfer_callback_with_ssm, ssm);
 
@@ -1170,8 +1169,8 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 
 		if (vdev->buffer_length < 50 ||
 		    memcmp (tlshd->read_buffer, WRONG_TLS_CERT_RSP, MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
-			print_hex(tlshd->read_buffer, vdev->buffer_length);
 			fp_err("TLS Certificate submitted isn't accepted by reader");
+			print_hex(tlshd->read_buffer, vdev->buffer_length);
 			fpi_ssm_mark_aborted(ssm, -EIO);
 			break;
 		}
@@ -1210,15 +1209,15 @@ static void handshake_ssm_cb(struct fpi_ssm *ssm)
 static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm)
 {
 	struct tls_handshake_t *tlshd;
+	struct fpi_ssm *ssm;
 
 	tlshd = g_new0(struct tls_handshake_t, 1);
 	tlshd->idev = idev;
 	tlshd->parent_ssm = parent_ssm;
 
-	struct fpi_ssm *ssm =
-	    fpi_ssm_new(idev->dev, handshake_ssm, TLS_HANDSHAKE_STATE_LAST);
-
+	ssm = fpi_ssm_new(idev->dev, handshake_ssm, TLS_HANDSHAKE_STATE_LAST);
 	ssm->priv = tlshd;
+
 	fpi_ssm_start(ssm, handshake_ssm_cb);
 }
 
@@ -1563,10 +1562,19 @@ static void save_image(struct fp_img_dev *idev)
 	++number_of_img;
 }
 
+static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
+{
+	struct vfs_init_t *vinit = ssm->priv;
+	struct fp_img_dev *idev = vinit->idev;
+
+	do_data_exchange(idev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
+}
+
 /* Main SSM loop */
 static void init_ssm(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_init_t *vinit = ssm->priv;
+	struct fp_img_dev *idev = vinit->idev;
 	struct vfs_dev_t *vdev = idev->priv;
 
 	switch (ssm->cur_state) {
@@ -1581,20 +1589,20 @@ static void init_ssm(struct fpi_ssm *ssm)
 
 	case INIT_STATE_MASTER_KEY:
 		puts("prf seed");
-		print_hex(vdev->main_seed, vdev->main_seed_length);
+		print_hex(vinit->main_seed, vinit->main_seed_length);
 
-		TLS_PRF2(PRE_KEY, sizeof(PRE_KEY), "GWK", vdev->main_seed,
-			vdev->main_seed_length,
-			vdev->masterkey_aes, VFS_MASTER_KEY_SIZE);
+		TLS_PRF2(PRE_KEY, sizeof(PRE_KEY), "GWK", vinit->main_seed,
+			 vinit->main_seed_length,
+			 vinit->masterkey_aes, VFS_MASTER_KEY_SIZE);
 
 		puts("AES master:");
-		print_hex(vdev->masterkey_aes, VFS_MASTER_KEY_SIZE);
+		print_hex(vinit->masterkey_aes, VFS_MASTER_KEY_SIZE);
 
 		fpi_ssm_next_state(ssm);
 		break;
 
 	case INIT_STATE_ECDSA_KEY:
-		if (make_ecdsa_key(vdev)) {
+		if (make_ecdsa_key(vinit, vdev->buffer)) {
 			fpi_ssm_next_state(ssm);
 		} else {
 			fp_err("Initialization failed at state %d, ECDSA key generation",
@@ -1605,7 +1613,9 @@ static void init_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case INIT_STATE_TLS_CERT:
-		memcpy(vdev->tls_certificate + 21, vdev->buffer + 0x116, 0xb8);
+		memcpy(vinit->tls_certificate, TLS_CERTIFICATE_BASE,
+		       G_N_ELEMENTS(TLS_CERTIFICATE_BASE));
+		memcpy(vinit->tls_certificate + 21, vdev->buffer + 0x116, 0xb8);
 
 		fpi_ssm_next_state(ssm);
 		break;
@@ -1613,14 +1623,14 @@ static void init_ssm(struct fpi_ssm *ssm)
 	case INIT_STATE_PUBLIC_KEY:
 	{
 		const int half_key = VFS_PUBLIC_KEY_SIZE / 2;
-		memcpy(vdev->pubkey, vdev->buffer + 0x600 + 10, half_key);
-		memcpy(vdev->pubkey + half_key, vdev->buffer + 0x640 + 0xe, half_key);
+		memcpy(vinit->pubkey, vdev->buffer + 0x600 + 10, half_key);
+		memcpy(vinit->pubkey + half_key, vdev->buffer + 0x640 + 0xe, half_key);
 
-		reverse_mem(vdev->pubkey, half_key);
-		reverse_mem(vdev->pubkey + half_key, half_key);
+		reverse_mem(vinit->pubkey, half_key);
+		reverse_mem(vinit->pubkey + half_key, half_key);
 
 		puts("pub key:");
-		print_hex(vdev->pubkey, VFS_PUBLIC_KEY_SIZE);
+		print_hex(vinit->pubkey, VFS_PUBLIC_KEY_SIZE);
 		fpi_ssm_next_state(ssm);
 		break;
 	}
@@ -1640,7 +1650,8 @@ static void init_ssm(struct fpi_ssm *ssm)
 static void dev_open_callback(struct fpi_ssm *ssm)
 {
 	/* Notify open complete */
-	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_init_t *vinit = ssm->priv;
+	struct fp_img_dev *idev = vinit->idev;
 	struct vfs_dev_t *vdev = idev->priv;
 
 	g_clear_pointer(&vdev->buffer, g_free);
@@ -1651,12 +1662,17 @@ static void dev_open_callback(struct fpi_ssm *ssm)
 
 	fpi_imgdev_open_complete(idev, ssm->error);
 
+	g_free(vinit->main_seed);
+	g_free(vinit);
 	fpi_ssm_free(ssm);
 }
 
 /* Open device */
 static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 {
+	struct fpi_ssm *ssm;
+	struct vfs_dev_t *vdev;
+	struct vfs_init_t *vinit;
 	SECStatus secs_status;
 
 	/* Claim usb interface */
@@ -1679,23 +1695,25 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	ERR_load_crypto_strings();
 
 	/* Initialize private structure */
-	struct vfs_dev_t *vdev = g_malloc0(sizeof(struct vfs_dev_t));
+	vdev = g_malloc0(sizeof(struct vfs_dev_t));
 	idev->priv = vdev;
 
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
-	memcpy(vdev->tls_certificate, TLS_CERTIFICATE_BASE,
-	       G_N_ELEMENTS(TLS_CERTIFICATE_BASE));
 
 	usb_operation(libusb_reset_device(idev->udev), idev);
 	usb_operation(libusb_set_configuration(idev->udev, 1), idev);
 	usb_operation(libusb_claim_interface(idev->udev, 0), idev);
 
-	generate_main_seed(idev);
 
 	/* Clearing previous device state */
-	struct fpi_ssm *ssm = fpi_ssm_new(idev->dev, init_ssm, INIT_STATE_LAST);
-	ssm->priv = idev;
+	ssm = fpi_ssm_new(idev->dev, init_ssm, INIT_STATE_LAST);
+
+	vinit = g_new0(struct vfs_init_t, 1);
+	vinit->idev = idev;
+	generate_main_seed(idev, vinit);
+
+	ssm->priv = vinit;
 	fpi_ssm_start(ssm, dev_open_callback);
 
 	return 0;
@@ -1795,9 +1813,11 @@ static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequenc
 	return do_data_exchange_sync(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
-static void send_activate_sequence(struct fpi_ssm *ssm, struct fp_img_dev *idev, int sequence)
+static void send_activate_sequence(struct fpi_ssm *ssm, int sequence)
 {
-	do_data_exchange(ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+	struct fp_img_dev *idev = ssm->priv;
+
+	do_data_exchange(idev, ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
 static void activate_device_interrupt_callback(struct fp_img_dev *idev, int status, void *data)
@@ -1833,7 +1853,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	case ACTIVATE_STATE_SEQ_7:
 	case ACTIVATE_STATE_SCAN_MATRIX:
 		printf("Activate State %d\n",ssm->cur_state);
-		send_activate_sequence(ssm, idev, ssm->cur_state - ACTIVATE_STATE_SEQ_1);
+		send_activate_sequence(ssm, ssm->cur_state - ACTIVATE_STATE_SEQ_1);
 		break;
 
 	case ACTIVATE_STATE_WAIT_DEVICE:

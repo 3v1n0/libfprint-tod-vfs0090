@@ -1880,7 +1880,20 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 
 	case SCAN_STATE_FAILED_TOO_SHORT:
 	case SCAN_STATE_FAILED_TOO_FAST:
-		fpi_imgdev_abort_scan(idev, FP_CAPTURE_FAIL);
+
+		switch (idev->action) {
+		case IMG_ACTION_ENROLL:
+			fpi_imgdev_abort_scan(idev, FP_ENROLL_RETRY_TOO_SHORT);
+			break;
+		case IMG_ACTION_VERIFY:
+			fpi_imgdev_abort_scan(idev, FP_VERIFY_RETRY_TOO_SHORT);
+			break;
+		case IMG_ACTION_CAPTURE:
+			fpi_imgdev_abort_scan(idev, FP_CAPTURE_FAIL);
+			break;
+		default:
+			fpi_imgdev_abort_scan(idev, 1);
+		}
 		fpi_imgdev_report_finger_status(idev, FALSE);
 
 		/* We could actually retrying again by going back to
@@ -1890,8 +1903,11 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 
 		break;
 
-	case SCAN_STATE_SUCCESS:
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
+		if (idev->action == IMG_ACTION_ENROLL)
+			fpi_imgdev_abort_scan(idev, FP_ENROLL_RETRY_CENTER_FINGER);
+
+	case SCAN_STATE_SUCCESS:
 		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");
 		fpi_ssm_mark_completed(ssm);
 

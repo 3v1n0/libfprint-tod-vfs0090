@@ -1790,7 +1790,7 @@ struct fp_img_driver vfs0090_driver = {
 	.flags = 0,
 	.img_width = VFS_IMAGE_SIZE,
 	.img_height = VFS_IMAGE_SIZE,
-	.bz3_threshold = 0,
+	.bz3_threshold = 10,
 
 	/* Routine specification */
 	.open = dev_open,

@@ -467,44 +467,15 @@ static gboolean usb_operation(int error, struct fp_img_dev *idev)
 	return TRUE;
 }
 
-static gboolean write_to_usb(struct fp_img_dev *idev,
-			     const unsigned char *data,
-			     int data_size)
+static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 {
-	int sent, error;
-
-	error = libusb_bulk_transfer(idev->udev, 0x01,
-				     (unsigned char *) data, data_size,
-				     &sent, VFS_USB_TIMEOUT);
-
-	if (error != 0) {
-		fp_err("USB write transfer error:", libusb_error_name(error));
+	if (ret != TRUE) {
+		fp_err("OpenSSL operation failed: %d", ret);
+		if (idev) {
+			fpi_imgdev_session_error(idev, -EIO);
+		}
 		return FALSE;
 	}
-
-	return TRUE;
-}
-
-static gboolean read_from_usb(struct fp_img_dev *idev,
-			      const unsigned char *buffer,
-			      int buffer_size, int *out_read)
-{
-	int read, error;
-
-	if (out_read)
-		*out_read = 0;
-
-	error = libusb_bulk_transfer(idev->udev, 0x81,
-				     (unsigned char *) buffer, buffer_size,
-				     &read, VFS_USB_TIMEOUT);
-
-	if (error != 0) {
-		fp_err("USB read transfer error:", libusb_error_name(error));
-		return FALSE;
-	}
-
-	if (out_read)
-		*out_read = read;
 
 	return TRUE;
 }
@@ -613,18 +584,6 @@ static unsigned char *tls_encrypt(struct fp_img_dev *idev,
 	return wr;
 }
 
-gboolean tls_write_to_usb(struct fp_img_dev *idev, const unsigned char *data, int data_len) {
-	unsigned char *encrypted;
-	int encrypted_len;
-	gboolean ret;
-
-	encrypted = tls_encrypt(idev, data, data_len, &encrypted_len);
-	ret = write_to_usb(idev, encrypted, encrypted_len);
-	free(encrypted);
-
-	return ret;
-}
-
 static gboolean tls_decrypt(struct fp_img_dev *idev,
 			    const unsigned char *buffer, int buffer_size,
 			    unsigned char *output_buffer, int *output_len)
@@ -671,17 +630,6 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 	return ret;
 }
 
-gboolean tls_read_from_usb(struct fp_img_dev *idev, unsigned char *output_buffer, int *output_len) {
-	unsigned char raw_buff[VFS_USB_BUFFER_SIZE];
-	int raw_buff_len;
-
-	if (read_from_usb(idev, raw_buff, sizeof(raw_buff), &raw_buff_len))
-		if (tls_decrypt(idev, raw_buff, raw_buff_len, output_buffer, output_len))
-			return TRUE;
-
-	return FALSE;
-}
-
 static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
 {
 	int i;
@@ -704,41 +652,6 @@ static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_ex
 	}
 
 	return TRUE;
-}
-
-static gboolean do_data_exchange_sync(struct fp_img_dev *idev, const struct data_exchange_t *dex, int mode)
-{
-	struct vfs_dev_t *vdev = idev->priv;
-
- //        g_clear_pointer(&vdev->buffer, g_free);
-	// vdev->buffer = g_malloc0(VFS_USB_BUFFER_SIZE);
-
-//DO async operations!
-	vdev->buffer_length = 0;
-	printf("Sizeof the pointed seq %u\n",dex->msg_length);
-	printf("sending data %p, len %u\n",dex->msg,dex->msg_length);
-
-	switch (mode) {
-	case DATA_EXCHANGE_PLAIN:
-		if (!write_to_usb(idev, dex->msg, dex->msg_length))
-			return FALSE;
-
-		if (!read_from_usb(idev, vdev->buffer, VFS_USB_BUFFER_SIZE, &vdev->buffer_length))
-			return FALSE;
-		break;
-
-	case DATA_EXCHANGE_ENCRYPTED:
-		if (!tls_write_to_usb(idev, dex->msg, dex->msg_length))
-			return FALSE;
-
-		if (!tls_read_from_usb(idev, vdev->buffer, &vdev->buffer_length))
-			return FALSE;
-		break;
-	}
-
-	printf("Read len is %d, expected %d\n",vdev->buffer_length,dex->rsp_length);
-
-	return check_data_exchange(vdev, dex);
 }
 
 struct data_exchange_async_data_t {
@@ -1221,205 +1134,6 @@ static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_
 	fpi_ssm_start(ssm, handshake_ssm_cb);
 }
 
-/*
-int writeImage(char* filename, int width, int height, float *buffer) {
-    int code = 0;
-    FILE *fp = NULL;
-    png_structp png_ptr = NULL;
-    png_infop info_ptr = NULL;
-
-    // Open file for writing (binary mode)
-    fp = fopen(filename, "wb");
-    if (fp == NULL) {
-	fprintf(stderr, "Could not open file %s for writing\n", filename);
-	code = 1;
-	goto finalise;
-    }
-
-    // Initialize write structure
-    png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (png_ptr == NULL) {
-	fprintf(stderr, "Could not allocate write struct\n");
-	code = 1;
-	goto finalise;
-    }
-
-    // Initialize info structure
-    info_ptr = png_create_info_struct(png_ptr);
-    if (info_ptr == NULL) {
-	fprintf(stderr, "Could not allocate info struct\n");
-	code = 1;
-	goto finalise;
-    }
-
-    // Setup Exception handling
-    if (setjmp(png_jmpbuf(png_ptr))) {
-	fprintf(stderr, "Error during png creation\n");
-	code = 1;
-	goto finalise;
-    }
-
-    png_init_io(png_ptr, fp);
-
-    // Write header (8 bit colour depth)
-    png_set_IHDR(png_ptr, info_ptr, width, height,
-	    8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
-	    PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
-
-
-    png_write_info(png_ptr, info_ptr);
-
-    // Write image data
-    int x, y;
-    for (y=0 ; y<height ; y++) {
-       png_write_row(png_ptr, buffer + 36 * y);
-    }
-
-    // End write
-    png_write_end(png_ptr, NULL);
-
-    finalise:
-    if (fp != NULL) fclose(fp);
-    if (info_ptr != NULL) png_free_data(png_ptr, info_ptr, PNG_FREE_ALL, -1);
-    if (png_ptr != NULL) png_destroy_write_struct(&png_ptr, (png_infopp)NULL);
-
-    return code;
-}
-*/
-static void fingerprint(struct fp_img_dev *idev) {
-    // const unsigned char data1[] = {
-    //     0x08, 0x5c, 0x20, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x04
-    // };
-    // const unsigned char data2[] = {
-    //     0x07, 0x80, 0x20, 0x00, 0x80, 0x04
-    // };
-    // const unsigned char data345[] = {
-    //     0x75
-    // };
-    // const unsigned char data67[] = {
-    //     0x43, 0x02
-    // };
-
-    const unsigned char data10[] = {
-	0x51, 0x00, 0x20, 0x00, 0x00 // read data - return buffer
-    };
-    // unsigned char data11[] = {
-    //     0x51, 0x00, 0x20, 0x00, 0x00
-    // };
-
-    unsigned char response[1024 * 1024];
-    int response_len = 0;
-
-    // tls_write_to_usb(idev, data1, sizeof(data1));
-    // tls_read_from_usb(idev, response, &response_len);
-    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
-    // // puts("READ:");print_hex(response, response_len);
-
-    // tls_write_to_usb(idev, data2, sizeof(data2));
-    // tls_read_from_usb(idev, response, &response_len);
-    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
-    // // puts("READ:");print_hex(response, response_len);
-
-    // for (int i =0; i < 3; i++ ){
-    //     tls_write_to_usb(idev, data345, sizeof(data345));
-    //     tls_read_from_usb(idev, response, &response_len);
-    //     g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
-    //     // puts("READ:");print_hex(response, response_len);
-    // }
-
-    // for (int i =0; i < 2; i++ ){
-    //     tls_write_to_usb(idev, data67, sizeof(data67));
-    //     tls_read_from_usb(idev, response, &response_len);
-    //     g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
-    //     // puts("READ:");print_hex(response, response_len);
-    // }
-    // g_print("SCAN MATRIX SEND\n");
-
-
-    // tls_write_to_usb(idev, SCAN_MATRIX2, sizeof(SCAN_MATRIX2));
-    // tls_read_from_usb(idev, response, &response_len);
-    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
-    // // puts("READ:");print_hex(response, response_len);
-
-    // tls_write_to_usb(idev, SCAN_MATRIX1, sizeof(SCAN_MATRIX1));
-    // tls_read_from_usb(idev, response, &response_len);
-    // g_print("TLS WRITE "G_STRLOC" response length is %d\n",response_len);
-    // // puts("READ:");print_hex(response, response_len);
-
-    unsigned char interrupt[0x100];
-    int interrupt_len;
-
-    const unsigned char desired_interrupt[] = { 0x03, 0x43, 0x04, 0x00, 0x41 };
-    const unsigned char other_scan_interrupt[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
-    const unsigned char scan_failed_swipe_interrupt[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
-    const unsigned char scan_failed_toofast_interrupt[] = { 0x03, 0x20, 0x07, 0x00, 0x00 };
-
-    puts("Awaiting fingerprint:");
-    while (TRUE) {
-	int status = libusb_interrupt_transfer(idev->udev, 0x83, interrupt, 0x100, &interrupt_len, 5 * 1000);
-	if (status == 0) {
-	    puts("interrupt:");
-	    print_hex(interrupt, interrupt_len);
-	    fflush(stdout);
-
-	    if (sizeof(desired_interrupt) == interrupt_len &&
-		    memcmp(desired_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
-		break;
-	    }
-	    if (sizeof(other_scan_interrupt) == interrupt_len &&
-		    memcmp(other_scan_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
-		printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
-		break;
-	    }
-	    if (sizeof(scan_failed_swipe_interrupt) == interrupt_len &&
-		    memcmp(scan_failed_swipe_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
-		puts("scan failed, swipe!");
-		return;
-	    }
-	    if (sizeof(scan_failed_toofast_interrupt) == interrupt_len &&
-		    memcmp(scan_failed_toofast_interrupt, interrupt, sizeof(desired_interrupt)) == 0) {
-		puts("scan failed, too fast");
-		return;
-	    }
-	}
-    }
-
-    unsigned char image[144 * 144];
-    int image_len = 0;
-
-    tls_write_to_usb(idev, data10, sizeof(data10));
-    tls_read_from_usb(idev, response, &response_len);
-    memcpy(image, response + 0x12, response_len - 0x12);
-    image_len += response_len - 0x12;
-
-    tls_write_to_usb(idev, data10, sizeof(data10));
-    tls_read_from_usb(idev, response, &response_len);
-    memcpy(image + image_len, response + 0x06, response_len - 0x06);
-    image_len += response_len - 0x06;
-
-    tls_write_to_usb(idev, data10, sizeof(data10));
-    tls_read_from_usb(idev, response, &response_len);
-    memcpy(image + image_len, response + 0x06, response_len - 0x06);
-    image_len += response_len - 0x06;
-
-    printf("total len  %d\n", image_len);
-    char nameprefix[80];
-    static int number_of_img = 0;
-    sprintf(nameprefix, "img %d.png",number_of_img);
-    // writeImage(nameprefix, 144, 144, image);
-
-    sprintf(nameprefix, "img %d.raw",number_of_img);
-    FILE *f = fopen(nameprefix, "wb");
-    fwrite(image, 144, 144, f);
-    fclose(f);
-
-    char msg[80];
-    sprintf(msg, "Image written - img %d.png, img %d.raw",number_of_img,number_of_img);
-    puts(msg);
-
-    ++number_of_img;
-}
-
 static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 {
 	const unsigned char waiting_finger[] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -1492,74 +1206,6 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 	print_hex(interrupt, interrupt_size);
 
 	return VFS_SCAN_UNKNOWN;
-}
-
-
-static int wait_for_finger_state(struct fp_img_dev *idev) {
-	unsigned char interrupt[0x100] = {};
-	int interrupt_len;
-
-
-	g_print("Wait for wait_for_finger_state, state is %d\n",idev->action_state);
-	while (TRUE) {
-		int status = libusb_interrupt_transfer(idev->udev, 0x83, interrupt, 0x100, &interrupt_len, 5 * 1000);
-		if (status == 0) {
-			puts("interrupt:");
-			print_hex(interrupt, interrupt_len);
-			fflush(stdout);
-
-			return translate_interrupt(interrupt, interrupt_len);
-		}
-	}
-
-	return VFS_SCAN_UNKNOWN;
-}
-
-static void save_image(struct fp_img_dev *idev)
-{
-	const unsigned char read_image_request[] = {
-		0x51, 0x00, 0x20, 0x00, 0x00 // read data - return buffer
-	};
-
-	unsigned char response[VFS_USB_BUFFER_SIZE];
-	unsigned char image[144 * 144];
-	int image_len = 0;
-	int response_len;
-
-	tls_write_to_usb(idev, read_image_request, sizeof(read_image_request));
-	tls_read_from_usb(idev, response, &response_len);
-	memcpy(image, response + 0x12, response_len - 0x12);
-	image_len += response_len - 0x12;
-
-	tls_write_to_usb(idev, read_image_request, sizeof(read_image_request));
-	tls_read_from_usb(idev, response, &response_len);
-	memcpy(image + image_len, response + 0x06, response_len - 0x06);
-	image_len += response_len - 0x06;
-
-	tls_write_to_usb(idev, read_image_request, sizeof(read_image_request));
-	tls_read_from_usb(idev, response, &response_len);
-	memcpy(image + image_len, response + 0x06, response_len - 0x06);
-	image_len += response_len - 0x06;
-
-	printf("total len  %d\n", image_len);
-	char nameprefix[80];
-	static int number_of_img = 0;
-	sprintf(nameprefix, "img %d.png",number_of_img);
-
-	sprintf(nameprefix, "img %d.raw",number_of_img);
-	FILE *f = fopen(nameprefix, "wb");
-	fwrite(image, 144, 144, f);
-	fclose(f);
-
-	char msg[80];
-	sprintf(msg, "Image written - img %d.png, img %d.raw",number_of_img,number_of_img);
-	puts(msg);
-
-	struct fp_img *img = fpi_img_new(sizeof(image));
-	memcpy(img->data, image, sizeof(image));
-	fpi_imgdev_image_captured(idev, img);
-
-	++number_of_img;
 }
 
 static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
@@ -1931,11 +1577,6 @@ static void start_finger_scan(struct fp_img_dev *idev)
 	ssm = fpi_ssm_new(idev->dev, finger_scan_ssm, SCAN_STATE_LAST);
 	ssm->priv = idev;
 	fpi_ssm_start(ssm, finger_scan_callback);
-}
-
-static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequence)
-{
-	return do_data_exchange_sync(idev, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
 static void send_activate_sequence(struct fpi_ssm *ssm, int sequence)

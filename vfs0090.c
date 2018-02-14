@@ -1719,6 +1719,114 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	return 0;
 }
 
+struct image_download_t {
+	struct fp_img_dev *idev;
+	struct fpi_ssm *ssm;
+
+	unsigned char image[144 * 144];
+	int image_size;
+};
+
+static void finger_image_download_callback(struct fpi_ssm *ssm)
+{
+	struct image_download_t *imgdown = ssm->priv;
+	struct fp_img_dev *idev = imgdown->idev;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	vdev->buffer_length = 0;
+	g_clear_pointer(&vdev->buffer, g_free);
+
+	if (!ssm->error) {
+		struct fp_img *img = fpi_img_new(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
+		img->flags = FP_IMG_H_FLIPPED;
+		memcpy(img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
+		fpi_imgdev_image_captured(idev, img);
+	} else {
+		fp_err("Scan failed failed at state %d, unexpected"
+		       "device reply during initialization", ssm->cur_state);
+		fpi_imgdev_session_error(idev, ssm->error);
+	}
+
+	fpi_imgdev_report_finger_status(idev, FALSE);
+
+	g_free(imgdown);
+	fpi_ssm_free(ssm);
+}
+
+static void finger_image_download_read_callback(struct fp_img_dev *idev, int status, void *data)
+{
+	struct image_download_t *imgdown = data;
+	struct fpi_ssm *ssm = imgdown->ssm;
+	struct vfs_dev_t *vdev = imgdown->idev->priv;
+	int offset = (ssm->cur_state == IMAGE_DOWNLOAD_STATE_1) ? 0x12 : 0x06;
+	int data_size = vdev->buffer_length - offset;
+
+	if (status != LIBUSB_TRANSFER_COMPLETED) {
+		fp_err("Image download failed at state %d", ssm->cur_state);
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, status);
+		return;
+	}
+
+	memcpy(imgdown->image + imgdown->image_size, vdev->buffer + offset, data_size);
+	imgdown->image_size += data_size;
+
+	fpi_ssm_next_state(ssm);
+}
+
+static void finger_image_download_ssm(struct fpi_ssm *ssm)
+{
+	struct image_download_t *imgdown = ssm->priv;
+	struct fp_img_dev *idev = imgdown->idev;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	const unsigned char read_buffer_request[] = {
+		0x51, 0x00, 0x20, 0x00, 0x00
+	};
+
+	switch (ssm->cur_state) {
+	case IMAGE_DOWNLOAD_STATE_1:
+	case IMAGE_DOWNLOAD_STATE_2:
+	case IMAGE_DOWNLOAD_STATE_3:
+
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    read_buffer_request,
+				    sizeof(read_buffer_request),
+				    vdev->buffer,
+				    VFS_IMAGE_SIZE * VFS_IMAGE_SIZE,
+				    finger_image_download_read_callback,
+				    imgdown);
+
+		break;
+
+	default:
+		fp_err("Unknown image download state");
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+	}
+}
+
+static void start_finger_image_download(struct fp_img_dev *idev)
+{
+	struct vfs_dev_t *vdev = idev->priv;
+	struct image_download_t *imgdown;
+	struct fpi_ssm *ssm;
+
+
+	vdev->buffer = g_malloc(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
+	vdev->buffer_length = 0;
+
+	ssm = fpi_ssm_new(idev->dev, finger_image_download_ssm, IMAGE_DOWNLOAD_STATE_LAST);
+
+	imgdown = g_new0(struct image_download_t, 1);
+	imgdown->idev = idev;
+	imgdown->ssm = ssm;
+
+	ssm->priv = imgdown;
+
+	fpi_ssm_start(ssm, finger_image_download_callback);
+}
+
 static void finger_scan_callback(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *idev = ssm->priv;
@@ -1732,6 +1840,10 @@ static void finger_scan_callback(struct fpi_ssm *ssm)
 
 	vdev->buffer_length = 0;
 	g_clear_pointer(&vdev->buffer, g_free);
+
+	if (!ssm->error)
+		start_finger_image_download(idev);
+
 	fpi_ssm_free(ssm);
 }
 
@@ -1781,9 +1893,8 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 	case SCAN_STATE_SUCCESS:
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
 		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");
-		save_image(idev);
-		fpi_imgdev_report_finger_status(idev, FALSE);
 		fpi_ssm_mark_completed(ssm);
+
 		break;
 
 	default:
@@ -1804,8 +1915,6 @@ static void start_finger_scan(struct fp_img_dev *idev)
 	ssm = fpi_ssm_new(idev->dev, finger_scan_ssm, SCAN_STATE_LAST);
 	ssm->priv = idev;
 	fpi_ssm_start(ssm, finger_scan_callback);
-
-	return 0;
 }
 
 static gboolean send_activate_sequence_sync(struct fp_img_dev *idev, int sequence)

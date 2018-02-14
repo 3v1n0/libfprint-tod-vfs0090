@@ -1556,6 +1556,8 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
 		if (idev->action == IMG_ACTION_ENROLL)
 			fpi_imgdev_abort_scan(idev, FP_ENROLL_RETRY_CENTER_FINGER);
+		else if (idev->action == IMG_ACTION_VERIFY)
+			fp_warn("Low quality image in verification, might fail");
 
 	case SCAN_STATE_SUCCESS:
 		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");

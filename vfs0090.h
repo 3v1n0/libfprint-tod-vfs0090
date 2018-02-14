@@ -108,6 +108,13 @@ enum IMAGE_DOWNLOAD_STATES {
 	IMAGE_DOWNLOAD_STATE_LAST
 };
 
+enum DEACTIVATE_STATES {
+	DEACTIVATE_STATE_SEQ_1,
+	DEACTIVATE_STATE_SEQ_2,
+
+	DEACTIVATE_STATE_LAST
+};
+
 enum VFS_READ_MODE {
 	VFS_READ_BULK,
 	VFS_READ_INTERRUPT,
@@ -636,5 +643,20 @@ static const struct data_exchange_t ACTIVATE_SEQUENCES[] = {
 		.msg_length = G_N_ELEMENTS(SCAN_MATRIX),
 		.rsp = NULL,
 		.rsp_length = 2366,
+	},
+};
+
+static const struct data_exchange_t DEACTIVATE_SEQUENCES[] = {
+	{
+		.msg = (unsigned char []) { 0x60, 0x00, 0x00, 0x00, 0x00 },
+		.msg_length = 5,
+		.rsp = (unsigned char []) { 0xf5, 0x04 },
+		.rsp_length = 2,
+	},
+	{
+		.msg = (unsigned char []) { 0x62, 0x00, 0x00, 0x00, 0x00 },
+		.msg_length = 5,
+		.rsp = (unsigned char []) { 0x00, 0x00 },
+		.rsp_length = 2,
 	},
 };

@@ -1695,14 +1695,60 @@ static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state)
 	return 0;
 }
 
-static void dev_deactivate(struct fp_img_dev *idev)
+static void send_deactivate_sequence(struct fpi_ssm *ssm, int sequence)
 {
+	struct fp_img_dev *idev = ssm->priv;
+	do_data_exchange(idev, ssm, &DEACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+}
+
+static void deactivate_ssm(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *idev = ssm->priv;
+
+	switch (ssm->cur_state) {
+	case DEACTIVATE_STATE_SEQ_1:
+	case DEACTIVATE_STATE_SEQ_2:
+		send_deactivate_sequence(ssm, ssm->cur_state - DEACTIVATE_STATE_SEQ_1);
+		break;
+
+	default:
+		fp_err("Unknown state");
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_aborted(ssm, -EIO);
+	}
+}
+
+static void dev_deactivate_callback(struct fpi_ssm *ssm)
+{
+	struct fp_img_dev *idev = ssm->priv;
 	struct vfs_dev_t *vdev = idev->priv;
+
+	if (ssm->error) {
+		fp_err("Deactivation failed failed at state %d, unexpected"
+		       "device reply during initialization", ssm->cur_state);
+		fpi_imgdev_session_error(idev, ssm->error);
+	}
 
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
 	fpi_imgdev_deactivate_complete(idev);
+
+	fpi_ssm_free(ssm);
+}
+
+static void dev_deactivate(struct fp_img_dev *idev)
+{
+	struct vfs_dev_t *vdev = idev->priv;
+	struct fpi_ssm *ssm;
+
+	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
+	vdev->buffer_length = 0;
+
+
+	ssm = fpi_ssm_new(idev->dev, deactivate_ssm, DEACTIVATE_STATE_LAST);
+	ssm->priv = idev;
+	fpi_ssm_start(ssm, dev_deactivate_callback);
 }
 
 static void dev_close(struct fp_img_dev *idev)

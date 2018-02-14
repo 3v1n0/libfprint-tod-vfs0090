@@ -1424,11 +1424,8 @@ static void fingerprint(struct fp_img_dev *idev) {
 static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 {
 	const unsigned char waiting_finger[] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
-	const unsigned char finger_down[] = { 0x02, 0x00, 0x40, 0x10, 0x00 };
-	const unsigned char finger_down2[] = { 0x02, 0x00, 0x40, 0x06, 0x06 };
-	const unsigned char finger_down3[] = { 0x02, 0x00, 0x40, 0x0e, 0x00 };
-	const unsigned char finger_down4[] = { 0x02, 0x00, 0x40, 0x0a, 0x01 };
-	const unsigned char finger_down5[] = { 0x02, 0x00, 0x40, 0x0f, 0x00 };
+	const unsigned char finger_down_prefix[] = { 0x02, 0x00, 0x40 };
+	const int finger_down_size = 5;
 	const unsigned char scanning_prints[] = { 0x03, 0x40, 0x01, 0x00, 0x00 };
 	const unsigned char scan_completed[] = { 0x03, 0x41, 0x03, 0x00, 0x40 };
 
@@ -1444,16 +1441,8 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 		return VFS_SCAN_WAITING_FOR_FINGER;
 	}
 
-	if ((sizeof(finger_down) == interrupt_size &&
-	     memcmp(finger_down, interrupt, interrupt_size) == 0) ||
-	    (sizeof(finger_down2) == interrupt_size &&
-	     memcmp(finger_down2, interrupt, interrupt_size) == 0) ||
-	    (sizeof(finger_down3) == interrupt_size &&
-	     memcmp(finger_down3, interrupt, interrupt_size) == 0) ||
-	    (sizeof(finger_down4) == interrupt_size &&
-	     memcmp(finger_down4, interrupt, interrupt_size) == 0) ||
-	    (sizeof(finger_down5) == interrupt_size &&
-	     memcmp(finger_down5, interrupt, interrupt_size) == 0)) {
+	if (finger_down_size == interrupt_size &&
+	     memcmp(finger_down_prefix, interrupt, sizeof(finger_down_prefix)) == 0) {
 		fp_info("Finger is on the sensor...");
 		return VFS_SCAN_FINGER_ON_SENSOR;
 	}

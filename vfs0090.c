@@ -1224,6 +1224,11 @@ static void init_ssm(struct fpi_ssm *ssm)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	switch (ssm->cur_state) {
+	case INIT_STATE_GENERATE_MAIN_SEED:
+                generate_main_seed(idev, vinit);
+                fpi_ssm_next_state(ssm);
+		break;
+
 	case INIT_STATE_SEQ_1:
 	case INIT_STATE_SEQ_2:
 	case INIT_STATE_SEQ_3:
@@ -1357,7 +1362,6 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 
 	vinit = g_new0(struct vfs_init_t, 1);
 	vinit->idev = idev;
-	generate_main_seed(idev, vinit);
 
 	ssm->priv = vinit;
 	fpi_ssm_start(ssm, dev_open_callback);

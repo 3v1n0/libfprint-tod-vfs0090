@@ -24,7 +24,7 @@
 #define DMI_PRODUCT_SERIAL_NODE "/sys/class/dmi/id/product_serial"
 
 #define VFS_USB_TIMEOUT 10000
-#define VFS_USB_INTERRUPT_TIMEOUT 5 * 1000
+#define VFS_USB_INTERRUPT_TIMEOUT 20 * 1000
 #define VFS_USB_BUFFER_SIZE 1024 * 1024
 
 #define VFS_MASTER_KEY_SIZE 0x20

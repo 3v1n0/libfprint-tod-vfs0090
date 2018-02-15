@@ -1526,7 +1526,13 @@ static void finger_scan_callback(struct fpi_ssm *ssm)
 	if (ssm->error) {
 		fp_err("Scan failed failed at state %d, unexpected "
 		       "device reply during finger scanning", ssm->cur_state);
-		fpi_imgdev_session_error(idev, ssm->error);
+
+		if (ssm->cur_state > SCAN_STATE_FINGER_ON_SENSOR) {
+			fpi_imgdev_abort_scan(idev, ssm->error);
+			fpi_imgdev_report_finger_status(idev, FALSE);
+		} else {
+			fpi_imgdev_session_error(idev, ssm->error);
+		}
 	}
 
 	vdev->buffer_length = 0;
@@ -1601,7 +1607,6 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case SCAN_STATE_HANDLE_SCAN_ERROR:
-		fpi_imgdev_abort_scan(idev, ssm->error);
 		fpi_ssm_jump_to_state(ssm, SCAN_STATE_DO_LED_RED_BLINK);
 		break;
 
@@ -1614,7 +1619,6 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 
 	case SCAN_STATE_AFTER_RED_BLINK:
 		fpi_ssm_mark_aborted(ssm, ssm->error);
-		fpi_imgdev_report_finger_status(idev, FALSE);
 
 		/* We could actually retrying again by going back to
 		 * ACTIVATE_STATE_SEQ_1, that would need to split the

@@ -65,6 +65,9 @@ struct vfs_init_t {
 #include <stdio.h>
 
 void print_hex_gn(unsigned char *data, int len, int sz) {
+	if (!len || !data)
+		return;
+
 	for (int i = 0; i < len; i++) {
 		if ((i % 16) == 0) {
 			if (i != 0) {

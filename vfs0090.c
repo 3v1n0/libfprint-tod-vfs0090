@@ -109,6 +109,8 @@ void print_hex(unsigned char *data, int len) {
 }
 
 /* remove emmmeeme */
+static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state);
+static void dev_deactivate(struct fp_img_dev *idev);
 
 static unsigned char *tls_encrypt(struct fp_img_dev *idev,
 				  const unsigned char *data, int data_size,
@@ -1400,6 +1402,13 @@ static void finger_image_download_callback(struct fpi_ssm *ssm)
 
 	fpi_imgdev_report_finger_status(idev, FALSE);
 
+	if (idev->action == IMG_ACTION_ENROLL &&
+	    idev->dev->state == DEV_STATE_ENROLLING &&
+	    idev->action_result != FP_ENROLL_COMPLETE) {
+		idev->action_state = IMG_ACQUIRE_STATE_DEACTIVATING;
+		dev_deactivate(idev);
+	}
+
 	g_free(imgdown);
 	fpi_ssm_free(ssm);
 }
@@ -1492,8 +1501,13 @@ static void finger_scan_callback(struct fpi_ssm *ssm)
 	vdev->buffer_length = 0;
 	g_clear_pointer(&vdev->buffer, g_free);
 
-	if (!ssm->error)
+	if (!ssm->error) {
 		start_finger_image_download(idev);
+	} else if (idev->action == IMG_ACTION_ENROLL &&
+		   idev->dev->state == DEV_STATE_ENROLLING) {
+		idev->action_state = IMG_ACQUIRE_STATE_DEACTIVATING;
+		dev_deactivate(idev);
+	}
 
 	fpi_ssm_free(ssm);
 }
@@ -1661,7 +1675,14 @@ static void dev_activate_callback(struct fpi_ssm *ssm)
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	fpi_imgdev_activate_complete(idev, ssm->error);
+	if (!ssm->error &&
+	    idev->action == IMG_ACTION_ENROLL &&
+	    idev->dev->state == DEV_STATE_ENROLLING) {
+		idev->action_state = IMG_ACQUIRE_STATE_AWAIT_FINGER_ON;
+		dev_change_state(idev, IMGDEV_STATE_AWAIT_FINGER_ON);
+	} else {
+		fpi_imgdev_activate_complete(idev, ssm->error);
+	}
 
 	if (!ssm->error)
 		start_finger_scan(idev);
@@ -1743,7 +1764,13 @@ static void dev_deactivate_callback(struct fpi_ssm *ssm)
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	fpi_imgdev_deactivate_complete(idev);
+	if (idev->action == IMG_ACTION_ENROLL &&
+	    idev->dev->state == DEV_STATE_ENROLLING) {
+		idev->action_state = IMG_ACQUIRE_STATE_ACTIVATING;
+		dev_activate(idev, IMGDEV_STATE_AWAIT_FINGER_ON);
+	} else {
+		fpi_imgdev_deactivate_complete(idev);
+	}
 
 	fpi_ssm_free(ssm);
 }

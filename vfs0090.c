@@ -1495,6 +1495,19 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 
 		break;
 
+
+	case IMAGE_DOWNLOAD_STATE_SUBMIT:
+		finger_image_submit(idev, imgdown);
+
+		if (idev->action == IMG_ACTION_VERIFY &&
+		    idev->action_result != FP_VERIFY_MATCH) {
+			fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
+		} else {
+			fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK);
+		}
+
+		break;
+
 	case IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK:
 		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_GREEN_BLINK, G_N_ELEMENTS(LED_GREEN_BLINK),
@@ -1503,10 +1516,18 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 
 		break;
 
-	case IMAGE_DOWNLOAD_STATE_SUBMIT:
-		finger_image_submit(idev, imgdown);
-		fpi_ssm_next_state(ssm);
 
+	case IMAGE_DOWNLOAD_STATE_RED_LED_BLINK:
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    led_blink_callback_with_ssm, ssm);
+
+		break;
+
+	case IMAGE_DOWNLOAD_STATE_AFTER_GREEN_LED_BLINK:
+	case IMAGE_DOWNLOAD_STATE_AFTER_RED_LED_BLINK:
+		fpi_ssm_mark_completed(ssm);
 		break;
 
 	default:

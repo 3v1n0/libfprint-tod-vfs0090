@@ -443,9 +443,6 @@ static void generate_main_seed(struct fp_img_dev *idev, struct vfs_init_t *vinit
 	memcpy(vinit->main_seed, name, name_len + 1);
 	memcpy(vinit->main_seed + name_len + 1, serial, serial_len + 1);
 
-	printf("Main seed is\n");
-	print_hex(vinit->main_seed, vinit->main_seed_length);
-
 	fclose(name_file);
 	fclose(serial_file);
 }
@@ -519,7 +516,7 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 
 	int prefix_len = (type != 0xFF) ? 5 : 0;
 
-    // header for hmac + data + hmac
+	// header for hmac + data + hmac
 	all_data = malloc(prefix_len + data_len + 0x20);
 	all_data[0] = type; all_data[1] = all_data[2] = 0x03; all_data[3] = (data_len >> 8) & 0xFF; all_data[4] = data_len & 0xFF;
 	memcpy(all_data + prefix_len, data, data_len);
@@ -773,8 +770,6 @@ static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *en
 	reverse_mem(res + 0x20, 0x20);
 	reverse_mem(res + 0x40, 0x20);
 
-	puts("Decoded:");
-	print_hex(res, res_len);
 	memcpy(vinit->ecdsa_private_key, res, VFS_ECDSA_PRIVATE_KEY_SIZE);
 
 	ret = check_pad(res, res_len);
@@ -797,10 +792,6 @@ static gboolean make_ecdsa_key(struct vfs_init_t *vinit, unsigned char *data)
 
 	memcpy(vinit->ecdsa_private_key + 0x20, data + 0x162, 0x20);
 	reverse_mem(vinit->ecdsa_private_key + 0x20, 0x20);
-
-	// ECDSA key
-	puts("ECDSA key:");
-	print_hex(vinit->ecdsa_private_key, 0x60);
 
 	return TRUE;
 }
@@ -910,16 +901,11 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		current_time = time(NULL);
 		memcpy(tlshd->client_random, &current_time, sizeof(time_t));
 		fill_buffer_with_random(tlshd->client_random + 4, G_N_ELEMENTS(tlshd->client_random) - 4);
-		puts("Client random");
-		print_hex(tlshd->client_random, sizeof(tlshd->client_random));
 
 		memcpy(client_hello, TLS_CLIENT_HELLO, G_N_ELEMENTS(TLS_CLIENT_HELLO));
 		memcpy(client_hello + 0xf, tlshd->client_random, G_N_ELEMENTS(tlshd->client_random));
 		HASH_Update(tlshd->tls_hash_context, client_hello + 0x09, 0x43);
 		HASH_Update(tlshd->tls_hash_context2, client_hello + 0x09, 0x43);
-
-		puts("Sending Client hello");
-		print_hex(client_hello, sizeof(TLS_CLIENT_HELLO));
 
 		async_data_exchange(idev, DATA_EXCHANGE_PLAIN,
 				    client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
@@ -940,9 +926,6 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		EVP_PKEY *priv, *pub;
 
 		memcpy(server_random, tlshd->read_buffer + 0xb, G_N_ELEMENTS(server_random));
-		puts("Server tls Random:");
-		print_hex(server_random, G_N_ELEMENTS(server_random));
-		// printf("server len %d\n", len); // remove len!
 		HASH_Update(tlshd->tls_hash_context, tlshd->read_buffer + 0x05, 0x3d);
 		HASH_Update(tlshd->tls_hash_context2, tlshd->read_buffer + 0x05, 0x3d);
 
@@ -987,13 +970,8 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 
 		TLS_PRF2(pre_master_secret, pre_master_secret_len, "master secret", seed, G_N_ELEMENTS(seed),
 			 tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret));
-		puts("master secret");
-		print_hex(tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret));
-
 		TLS_PRF2(tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret), "key expansion",
 			seed, G_N_ELEMENTS(seed), vdev->key_block, G_N_ELEMENTS(vdev->key_block));
-		puts("Keyblock");
-		print_hex(vdev->key_block, G_N_ELEMENTS(vdev->key_block));
 
 		g_free(pre_master_secret);
 		EC_KEY_free(priv_key);
@@ -1019,14 +997,9 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		HASH_Update(tlshd->tls_hash_context2, vinit->tls_certificate + 0x09, 0x109);
 
 		HASH_End(tlshd->tls_hash_context, test, &test_len, G_N_ELEMENTS(test));
-		puts("Hash");
-		print_hex(test, 0x20);
 
 		ecdsa_key = load_key(vinit->ecdsa_private_key, TRUE);
 		cert_verify_signature = sign2(ecdsa_key, test, 0x20);
-
-		printf("\nCert signed: \n");
-		print_hex(cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
 		memcpy(vinit->tls_certificate + 0x09 + 0x109 + 0x04, cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
 
 		// encrypted finished
@@ -1034,25 +1007,15 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		HASH_Update(tlshd->tls_hash_context2, vinit->tls_certificate + 0x09 + 0x109, 0x4c);
 		HASH_End(tlshd->tls_hash_context2, handshake_messages, &len3, 0x20);
 
-		puts("hash of handshake messages");
-		print_hex(handshake_messages, 0x20); // ok
-
 		unsigned char finished_message[0x10] = { 0x14, 0x00, 0x00, 0x0c, 0 };
-		print_hex(finished_message, 0x10);
 		unsigned char client_finished[0x0c];
 		TLS_PRF2(tlshd->master_secret, 0x30, "client finished", handshake_messages, 0x20,
 			 client_finished, G_N_ELEMENTS(client_finished));
 		memcpy(finished_message + 0x04, client_finished, G_N_ELEMENTS(client_finished));
 		// copy handshake protocol
 
-		puts("client finished");
-		print_hex(finished_message, 0x10);
-
 		mac_then_encrypt(0x16, vdev->key_block, finished_message, 0x10, &final, &len);
 		memcpy(vinit->tls_certificate + 0x169, final, len);
-
-		puts("final");
-		print_hex(final, len);
 
 		EC_KEY_free(ecdsa_key);
 
@@ -1080,7 +1043,6 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 		if (vdev->buffer_length < 50 ||
 		    memcmp (tlshd->read_buffer, WRONG_TLS_CERT_RSP, MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
 			fp_err("TLS Certificate submitted isn't accepted by reader");
-			print_hex(tlshd->read_buffer, vdev->buffer_length);
 			fpi_ssm_mark_aborted(ssm, -EIO);
 			break;
 		}
@@ -1248,15 +1210,9 @@ static void init_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case INIT_STATE_MASTER_KEY:
-		puts("prf seed");
-		print_hex(vinit->main_seed, vinit->main_seed_length);
-
 		TLS_PRF2(PRE_KEY, sizeof(PRE_KEY), "GWK", vinit->main_seed,
 			 vinit->main_seed_length,
 			 vinit->masterkey_aes, VFS_MASTER_KEY_SIZE);
-
-		puts("AES master:");
-		print_hex(vinit->masterkey_aes, VFS_MASTER_KEY_SIZE);
 
 		fpi_ssm_next_state(ssm);
 		break;
@@ -1289,8 +1245,6 @@ static void init_ssm(struct fpi_ssm *ssm)
 		reverse_mem(vinit->pubkey, half_key);
 		reverse_mem(vinit->pubkey + half_key, half_key);
 
-		puts("pub key:");
-		print_hex(vinit->pubkey, VFS_PUBLIC_KEY_SIZE);
 		fpi_ssm_next_state(ssm);
 		break;
 	}
@@ -1342,8 +1296,6 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 		fp_err("could not claim interface 0");
 		return error;
 	}
-
-	printf("Opening %p\n",idev->udev);
 
 	secs_status = NSS_NoDB_Init(NULL);
 	if (secs_status != SECSuccess) {
@@ -1585,9 +1537,6 @@ static void finger_scan_interrupt_callback(struct fp_img_dev *idev, int status, 
 	int interrupt_type;
 
 	interrupt_type = translate_interrupt(vdev->buffer, vdev->buffer_length);
-	g_print("INTERRUPT CALLBACK (finger_scan_interrupt_callback) %d, type %d\n",
-	        status, interrupt_type);
-	print_hex(vdev->buffer, vdev->buffer_length);
 	fpi_ssm_jump_to_state(ssm, interrupt_type);
 }
 
@@ -1638,7 +1587,6 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 		}
 
 	case SCAN_STATE_SUCCESS:
-		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");
 		fpi_ssm_mark_completed(ssm);
 
 		break;
@@ -1731,7 +1679,6 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	case ACTIVATE_STATE_SEQ_6:
 	case ACTIVATE_STATE_SEQ_7:
 	case ACTIVATE_STATE_SCAN_MATRIX:
-		printf("Activate State %d\n",ssm->cur_state);
 		send_activate_sequence(ssm, ssm->cur_state - ACTIVATE_STATE_SEQ_1);
 		break;
 
@@ -1789,7 +1736,6 @@ static int dev_activate(struct fp_img_dev *idev, enum fp_imgdev_state state)
 
 static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state)
 {
-	printf("DEV STATE CHANGE TO %d\n",state);
 	switch(state) {
 		case IMGDEV_STATE_INACTIVE:
 			printf("State change: IMGDEV_STATE_INACTIVE\n");
@@ -1837,8 +1783,8 @@ static void dev_deactivate_callback(struct fpi_ssm *ssm)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	if (ssm->error) {
-		fp_err("Deactivation failed failed at state %d, unexpected"
-		       "device reply during initialization", ssm->cur_state);
+		fp_err("Deactivation failed failed at state %d, unexpected "
+		       "device reply during deactivation", ssm->cur_state);
 		fpi_imgdev_session_error(idev, ssm->error);
 	}
 

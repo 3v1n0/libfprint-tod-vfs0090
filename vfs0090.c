@@ -299,20 +299,16 @@ static void async_read_encrypted_callback(struct fp_img_dev *idev, int status, v
 {
 	struct async_usb_encrypted_operation_data_t *enc_op = data;
 	struct vfs_dev_t *vdev = idev->priv;
-	unsigned char decrypted_data[VFS_USB_BUFFER_SIZE];
-	int decrypted_data_size;
+
+	enc_op->encrypted_data = g_memdup(vdev->buffer, vdev->buffer_length);
+	enc_op->encrypted_data_size = vdev->buffer_length;
 
 	if (status == LIBUSB_TRANSFER_COMPLETED &&
-	    !tls_decrypt(idev, vdev->buffer, vdev->buffer_length,
-			 decrypted_data, &decrypted_data_size)) {
+	    !tls_decrypt(idev, enc_op->encrypted_data,
+			 enc_op->encrypted_data_size,
+			 vdev->buffer, &vdev->buffer_length)) {
 		status = LIBUSB_TRANSFER_ERROR;
 	}
-
-	g_free(vdev->buffer);
-	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
-	vdev->buffer_length = decrypted_data_size;
-
-	memcpy(vdev->buffer, decrypted_data, decrypted_data_size);
 
 	if (enc_op->callback)
 		enc_op->callback(idev, status, enc_op->callback_data);
@@ -482,6 +478,7 @@ static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 
 static PK11Context* hmac_make_context(const unsigned char *key_bytes, int key_len)
 {
+	PK11SymKey *pkKey;
 	CK_MECHANISM_TYPE hmacMech = CKM_SHA256_HMAC;
 	PK11SlotInfo *slot = PK11_GetBestSlot(hmacMech, NULL);
 
@@ -490,12 +487,14 @@ static PK11Context* hmac_make_context(const unsigned char *key_bytes, int key_le
 	key.data = (unsigned char*) key_bytes;
 	key.len = key_len;
 
-	PK11SymKey *pkKey = PK11_ImportSymKey(slot, hmacMech, PK11_OriginUnwrap, CKA_SIGN, &key, NULL);
+	pkKey = PK11_ImportSymKey(slot, hmacMech, PK11_OriginUnwrap, CKA_SIGN, &key, NULL);
 
 	SECItem param = { .type = siBuffer, .data = NULL, .len = 0 };
 
 	PK11Context* context = PK11_CreateContextBySymKey(hmacMech, CKA_SIGN, pkKey, &param);
 	PK11_DigestBegin(context);
+	PK11_FreeSlot(slot);
+	PK11_FreeSymKey(pkKey);
 
 	return context;
 }
@@ -591,37 +590,37 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 	struct vfs_dev_t *vdev = idev->priv;
 
 	int buff_len = buffer_size - 5;
-	const unsigned char *buff = buffer + 5;
+	int out_len = buff_len - 0x10;
+	int tlen1 = 0, tlen2;
 	gboolean ret = FALSE;
-	*output_len = 0;
 
 	g_assert(vdev->key_block);
 
+	buffer += 5;
+	*output_len = 0;
+
 	EVP_CIPHER_CTX *context = EVP_CIPHER_CTX_new();
-	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vdev->key_block + 0x60, buff)) {
+	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vdev->key_block + 0x60, buffer)) {
 		fp_err("Decryption failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
 		goto out;
 	}
+
 	EVP_CIPHER_CTX_set_padding(context, 0);
 
-	int res_len = buff_len - 0x10;
-	int tlen1 = 0, tlen2;
-	unsigned char *res = malloc(res_len);
-	if (!EVP_DecryptUpdate(context, res, &tlen1, buff + 0x10, res_len)) {
+	if (!EVP_DecryptUpdate(context, output_buffer, &tlen1, buffer + 0x10, out_len)) {
 		fp_err("Decryption failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
 		goto out;
 	}
 
-	if (!EVP_DecryptFinal(context, res + tlen1, &tlen2)) {
+	if (!EVP_DecryptFinal(context, output_buffer + tlen1, &tlen2)) {
 		fp_err("Decryption failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
 		goto out;
 	}
 
-	*output_len = tlen1 + tlen2 - 0x20 - (res[res_len - 1] + 1);
-	memcpy(output_buffer, res, *output_len);
+	*output_len = tlen1 + tlen2 - 0x20 - (output_buffer[out_len - 1] + 1);
 	ret = TRUE;
 
 	out:
@@ -872,6 +871,7 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 	res = malloc(len);
 	unsigned char *f = res;
 	i2d_ECDSA_SIG(sig, &f);
+	ECDSA_SIG_free(sig);
     } while (len != VFS_ECDSA_SIGNATURE_SIZE);
 
     return res;
@@ -979,6 +979,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 			fp_err("Failed to compute key, error: %lu, %s",
 			ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
 			fpi_ssm_mark_aborted(ssm, ERR_peek_last_error());
+			g_free(pre_master_secret);
 			break;
 		}
 
@@ -1336,7 +1337,7 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 
 	printf("Opening %p\n",idev->udev);
 
-	secs_status = NSS_NoDB_Init(".");
+	secs_status = NSS_NoDB_Init(NULL);
 	if (secs_status != SECSuccess) {
 		fp_err("could not initialise NSS");
 		return -1;
@@ -1530,6 +1531,7 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 
 	case SCAN_STATE_FAILED_TOO_SHORT:
 	case SCAN_STATE_FAILED_TOO_FAST:
+		fpi_ssm_mark_aborted(ssm, ssm->cur_state);
 
 		switch (idev->action) {
 		case IMG_ACTION_ENROLL:
@@ -1762,6 +1764,10 @@ static void dev_close(struct fp_img_dev *idev)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	usb_operation(libusb_release_interface(idev->udev, 0), NULL);
+
+	NSS_Shutdown();
+	ERR_free_strings();
+	EVP_cleanup();
 
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;

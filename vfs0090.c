@@ -517,10 +517,7 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	unsigned char *all_data, *hmac, *pad;
 	const unsigned char iv[] = {0x4b, 0x77, 0x62, 0xff, 0xa9, 0x03, 0xc1, 0x1e, 0x6f, 0xd8, 0x35, 0x93, 0x17, 0x2d, 0x54, 0xef};
 
-	int prefix_len = 5;
-	if (type == 0xFF) {
-		prefix_len = 0;
-	}
+	int prefix_len = (type != 0xFF) ? 5 : 0;
 
     // header for hmac + data + hmac
 	all_data = malloc(prefix_len + data_len + 0x20);
@@ -1390,7 +1387,21 @@ static void finger_image_download_callback(struct fpi_ssm *ssm)
 	if (!ssm->error) {
 		struct fp_img *img = fpi_img_new(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 		img->flags = FP_IMG_H_FLIPPED;
+		img->width = VFS_IMAGE_SIZE;
+		img->height = VFS_IMAGE_SIZE;
 		memcpy(img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
+
+		if (VFS_IMAGE_RESCALE > 1) {
+			struct fp_img *resized;
+
+			resized = fpi_im_resize(img,
+						VFS_IMAGE_RESCALE,
+						VFS_IMAGE_RESCALE);
+			fp_img_free(img);
+
+			img = resized;
+		}
+
 		fpi_imgdev_image_captured(idev, img);
 	} else {
 		fp_err("Scan failed failed at state %d, unexpected"
@@ -1797,10 +1808,10 @@ struct fp_img_driver vfs0090_driver = {
 	},
 
 	/* Image specification */
-	.img_width = VFS_IMAGE_SIZE,
 	.flags = FP_IMGDRV_NEEDS_REACTIVATION_BETWEEN_ENROLLS,
-	.img_height = VFS_IMAGE_SIZE,
-	.bz3_threshold = 10,
+	.img_width = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE,
+	.img_height = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE,
+	.bz3_threshold = 12,
 
 	/* Routine specification */
 	.open = dev_open,

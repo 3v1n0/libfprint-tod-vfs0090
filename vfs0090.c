@@ -1590,34 +1590,27 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 
 	case SCAN_STATE_FAILED_TOO_SHORT:
 	case SCAN_STATE_FAILED_TOO_FAST:
-		fpi_ssm_mark_aborted(ssm, ssm->cur_state);
-
 		switch (idev->action) {
 		case IMG_ACTION_ENROLL:
-			fpi_imgdev_abort_scan(idev, FP_ENROLL_RETRY_TOO_SHORT);
+			ssm->error = FP_ENROLL_RETRY_TOO_SHORT;
 			break;
 		case IMG_ACTION_VERIFY:
-			fpi_imgdev_abort_scan(idev, FP_VERIFY_RETRY_TOO_SHORT);
+			ssm->error = FP_VERIFY_RETRY_TOO_SHORT;
 			break;
 		case IMG_ACTION_CAPTURE:
-			fpi_imgdev_abort_scan(idev, FP_CAPTURE_FAIL);
+			ssm->error = FP_CAPTURE_FAIL;
 			break;
 		default:
-			fpi_imgdev_abort_scan(idev, 1);
+			ssm->error = 1;
 		}
-		fpi_imgdev_report_finger_status(idev, FALSE);
 
-		/* We could actually retrying again by going back to
-		 * ACTIVATE_STATE_SEQ_1, that would need to split the
-		 * SSMs though, to repeat the activation states again
-		 * without informing the driver */
-
+		fpi_ssm_jump_to_state(ssm, SCAN_STATE_HANDLE_SCAN_ERROR);
 		break;
 
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
 		if (idev->action == IMG_ACTION_ENROLL) {
-			fpi_imgdev_abort_scan(idev, FP_ENROLL_RETRY_CENTER_FINGER);
-			fpi_ssm_mark_aborted(ssm, FP_ENROLL_RETRY_CENTER_FINGER);
+			ssm->error = FP_ENROLL_RETRY_CENTER_FINGER;
+			fpi_ssm_jump_to_state(ssm, SCAN_STATE_HANDLE_SCAN_ERROR);
 			break;
 		} else if (idev->action == IMG_ACTION_VERIFY) {
 			fp_warn("Low quality image in verification, might fail");
@@ -1626,6 +1619,29 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 	case SCAN_STATE_SUCCESS:
 		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");
 		fpi_ssm_mark_completed(ssm);
+
+		break;
+
+	case SCAN_STATE_HANDLE_SCAN_ERROR:
+		fpi_imgdev_abort_scan(idev, ssm->error);
+		fpi_ssm_jump_to_state(ssm, SCAN_STATE_DO_LED_RED_BLINK);
+		break;
+
+	case SCAN_STATE_DO_LED_RED_BLINK:
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    led_blink_callback_with_ssm, ssm);
+		break;
+
+	case SCAN_STATE_AFTER_RED_BLINK:
+		fpi_ssm_mark_aborted(ssm, ssm->error);
+		fpi_imgdev_report_finger_status(idev, FALSE);
+
+		/* We could actually retrying again by going back to
+		 * ACTIVATE_STATE_SEQ_1, that would need to split the
+		 * SSMs though, to repeat the activation states again
+		 * without informing the driver */
 
 		break;
 

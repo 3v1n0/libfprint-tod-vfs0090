@@ -304,6 +304,7 @@ static void async_read_encrypted_callback(struct fp_img_dev *idev, int status, v
 	enc_op->encrypted_data_size = vdev->buffer_length;
 
 	if (status == LIBUSB_TRANSFER_COMPLETED &&
+	    enc_op->encrypted_data && enc_op->encrypted_data_size &&
 	    !tls_decrypt(idev, enc_op->encrypted_data,
 			 enc_op->encrypted_data_size,
 			 vdev->buffer, &vdev->buffer_length)) {
@@ -589,6 +590,7 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 	gboolean ret = FALSE;
 
 	g_assert(vdev->key_block);
+	g_assert(buffer && buffer_size);
 
 	buffer += 5;
 	*output_len = 0;

@@ -1653,6 +1653,12 @@ static void activate_ssm(struct fpi_ssm *ssm)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	switch (ssm->cur_state) {
+	case ACTIVATE_STATE_GREEN_LED_ON:
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    LED_GREEN_ON, G_N_ELEMENTS(LED_GREEN_ON),
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    async_transfer_callback_with_ssm, ssm);
+		break;
 	case ACTIVATE_STATE_SEQ_1:
 	case ACTIVATE_STATE_SEQ_2:
 	case ACTIVATE_STATE_SEQ_3:

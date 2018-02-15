@@ -658,10 +658,15 @@ static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 	struct data_exchange_async_data_t *dex_data = data;
 	struct vfs_dev_t *vdev = idev->priv;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED &&
-	    check_data_exchange(vdev, dex_data->dex)) {
-		fpi_ssm_next_state(dex_data->ssm);
-	} else {
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		if (check_data_exchange(vdev, dex_data->dex)) {
+			fpi_ssm_next_state(dex_data->ssm);
+		} else {
+			status = LIBUSB_TRANSFER_ERROR;
+		}
+	}
+
+	if (status != LIBUSB_TRANSFER_COMPLETED) {
 		fp_err("Data exchange failed at state %d", dex_data->ssm->cur_state);
 		fpi_imgdev_session_error(idev, -EIO);
 		fpi_ssm_mark_aborted(dex_data->ssm, status);

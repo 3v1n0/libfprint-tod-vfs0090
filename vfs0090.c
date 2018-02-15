@@ -860,21 +860,21 @@ static void fill_buffer_with_random(unsigned char *buffer, int size)
 }
 
 static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
-    int len = 0;
-    unsigned char *res = NULL;
+	int len = 0;
+	unsigned char *res = NULL;
 
-    do {
-	ECDSA_SIG *sig = ECDSA_do_sign(data, data_len, key);
-	len = i2d_ECDSA_SIG(sig, NULL);
+	do {
+		ECDSA_SIG *sig = ECDSA_do_sign(data, data_len, key);
+		len = i2d_ECDSA_SIG(sig, NULL);
 
-	free(res);
-	res = malloc(len);
-	unsigned char *f = res;
-	i2d_ECDSA_SIG(sig, &f);
-	ECDSA_SIG_free(sig);
-    } while (len != VFS_ECDSA_SIGNATURE_SIZE);
+		free(res);
+		res = malloc(len);
+		unsigned char *f = res;
+		i2d_ECDSA_SIG(sig, &f);
+		ECDSA_SIG_free(sig);
+	} while (len != VFS_ECDSA_SIGNATURE_SIZE);
 
-    return res;
+	return res;
 }
 
 struct tls_handshake_t {
@@ -1226,8 +1226,8 @@ static void init_ssm(struct fpi_ssm *ssm)
 
 	switch (ssm->cur_state) {
 	case INIT_STATE_GENERATE_MAIN_SEED:
-                generate_main_seed(idev, vinit);
-                fpi_ssm_next_state(ssm);
+		generate_main_seed(idev, vinit);
+		fpi_ssm_next_state(ssm);
 		break;
 
 	case INIT_STATE_SEQ_1:

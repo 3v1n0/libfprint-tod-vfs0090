@@ -1458,7 +1458,8 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 	case IMAGE_DOWNLOAD_STATE_SUBMIT:
 		finger_image_submit(idev, imgdown);
 
-		if (idev->action == IMG_ACTION_VERIFY &&
+		if ((idev->action == IMG_ACTION_VERIFY ||
+		     idev->action == IMG_ACTION_IDENTIFY) &&
 		    idev->action_result != FP_VERIFY_MATCH) {
 			fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
 		} else {

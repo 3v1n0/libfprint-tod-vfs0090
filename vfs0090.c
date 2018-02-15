@@ -1395,26 +1395,7 @@ static void finger_image_download_callback(struct fpi_ssm *ssm)
 	vdev->buffer_length = 0;
 	g_clear_pointer(&vdev->buffer, g_free);
 
-	if (!ssm->error) {
-		struct fp_img *img = fpi_img_new(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
-		img->flags = FP_IMG_H_FLIPPED;
-		img->width = VFS_IMAGE_SIZE;
-		img->height = VFS_IMAGE_SIZE;
-		memcpy(img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
-
-		if (VFS_IMAGE_RESCALE > 1) {
-			struct fp_img *resized;
-
-			resized = fpi_im_resize(img,
-						VFS_IMAGE_RESCALE,
-						VFS_IMAGE_RESCALE);
-			fp_img_free(img);
-
-			img = resized;
-		}
-
-		fpi_imgdev_image_captured(idev, img);
-	} else {
+	if (ssm->error) {
 		fp_err("Scan failed failed at state %d, unexpected"
 		       "device reply during initialization", ssm->cur_state);
 		fpi_imgdev_session_error(idev, ssm->error);
@@ -1424,6 +1405,30 @@ static void finger_image_download_callback(struct fpi_ssm *ssm)
 
 	g_free(imgdown);
 	fpi_ssm_free(ssm);
+}
+
+static void finger_image_submit(struct fp_img_dev *idev, struct image_download_t *imgdown)
+{
+	struct fp_img *img;
+
+	img = fpi_img_new(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
+	img->flags = FP_IMG_H_FLIPPED;
+	img->width = VFS_IMAGE_SIZE;
+	img->height = VFS_IMAGE_SIZE;
+	memcpy(img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
+
+	if (VFS_IMAGE_RESCALE > 1) {
+		struct fp_img *resized;
+
+		resized = fpi_im_resize(img,
+					VFS_IMAGE_RESCALE,
+					VFS_IMAGE_RESCALE);
+		fp_img_free(img);
+
+		img = resized;
+	}
+
+	fpi_imgdev_image_captured(idev, img);
 }
 
 static void finger_image_download_read_callback(struct fp_img_dev *idev, int status, void *data)
@@ -1461,7 +1466,6 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 	case IMAGE_DOWNLOAD_STATE_1:
 	case IMAGE_DOWNLOAD_STATE_2:
 	case IMAGE_DOWNLOAD_STATE_3:
-
 		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
 				    read_buffer_request,
 				    sizeof(read_buffer_request),
@@ -1469,6 +1473,12 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 				    VFS_IMAGE_SIZE * VFS_IMAGE_SIZE,
 				    finger_image_download_read_callback,
 				    imgdown);
+
+		break;
+
+	case IMAGE_DOWNLOAD_STATE_SUBMIT:
+		finger_image_submit(idev, imgdown);
+		fpi_ssm_next_state(ssm);
 
 		break;
 

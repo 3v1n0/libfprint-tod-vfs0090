@@ -1340,13 +1340,6 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	return 0;
 }
 
-static void led_blink_callback_timeout(void *data)
-{
-	struct fpi_ssm *ssm = data;
-
-	fpi_ssm_next_state(ssm);
-}
-
 static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, void *data)
 {
 	struct fpi_ssm *ssm = data;
@@ -1356,7 +1349,7 @@ static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, voi
 		fp_err("LED blinking failed with error %d", status);
 	}
 
-	fpi_timeout_add(500, led_blink_callback_timeout, ssm);
+	fpi_timeout_add(500, (fpi_timeout_fn) fpi_ssm_next_state, ssm);
 }
 
 struct image_download_t {

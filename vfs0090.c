@@ -1378,6 +1378,25 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	return 0;
 }
 
+static void led_blink_callback_timeout(void *data)
+{
+	struct fpi_ssm *ssm = data;
+
+	fpi_ssm_next_state(ssm);
+}
+
+static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, void *data)
+{
+	struct fpi_ssm *ssm = data;
+
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		fpi_timeout_add(500, led_blink_callback_timeout, ssm);
+	} else {
+		/* NO need to fail here, it's not a big issue... */
+		fp_err("LED blinking failed with error %d", status);
+	}
+}
+
 struct image_download_t {
 	struct fp_img_dev *idev;
 	struct fpi_ssm *ssm;
@@ -1473,6 +1492,14 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 				    VFS_IMAGE_SIZE * VFS_IMAGE_SIZE,
 				    finger_image_download_read_callback,
 				    imgdown);
+
+		break;
+
+	case IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK:
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    LED_GREEN_BLINK, G_N_ELEMENTS(LED_GREEN_BLINK),
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    led_blink_callback_with_ssm, ssm);
 
 		break;
 

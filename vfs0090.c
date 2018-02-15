@@ -1556,10 +1556,13 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
-		if (idev->action == IMG_ACTION_ENROLL)
+		if (idev->action == IMG_ACTION_ENROLL) {
 			fpi_imgdev_abort_scan(idev, FP_ENROLL_RETRY_CENTER_FINGER);
-		else if (idev->action == IMG_ACTION_VERIFY)
+			fpi_ssm_mark_aborted(ssm, FP_ENROLL_RETRY_CENTER_FINGER);
+			break;
+		} else if (idev->action == IMG_ACTION_VERIFY) {
 			fp_warn("Low quality image in verification, might fail");
+		}
 
 	case SCAN_STATE_SUCCESS:
 		printf("IMAGE SCANNED FINE! NEED TO PARSE IT!\n");
@@ -1752,7 +1755,6 @@ static void dev_deactivate(struct fp_img_dev *idev)
 
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
-
 
 	ssm = fpi_ssm_new(idev->dev, deactivate_ssm, DEACTIVATE_STATE_LAST);
 	ssm->priv = idev;

@@ -628,13 +628,12 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 
 static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
 {
-	int i;
-
 	if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
 		fp_err("Expected len: %d, but got %d\n",
 		       dex->rsp_length, vdev->buffer_length);
 		return FALSE;
 	} else if (dex->rsp_length > 0 && dex->rsp != NULL) {
+		int i;
 		const unsigned char *expected = dex->rsp;
 
 		for (i = 0; i < vdev->buffer_length; ++i) {
@@ -1227,8 +1226,20 @@ static void init_ssm(struct fpi_ssm *ssm)
 		fpi_ssm_next_state(ssm);
 		break;
 
-	case INIT_STATE_SEQ_1:
 	case INIT_STATE_SEQ_2:
+		send_init_sequence(ssm, ssm->cur_state - INIT_STATE_SEQ_1);
+		if (vdev->buffer[vdev->buffer_length-1] != 0x07) {
+			fp_err("Sensor not initialized, init byte is 0x%x " \
+			       "(should be 0x07 on initialized devices, 0x02 " \
+			       "otherwise)\n" \
+			       "This is a driver in alpha state and the " \
+			       "device needs to be setup in a VirtualBox " \
+			       "instance running Windows first.",
+			       vdev->buffer[vdev->buffer_length-1]);
+			fpi_ssm_mark_aborted(ssm, -EIO);
+		}
+		break;
+	case INIT_STATE_SEQ_1:
 	case INIT_STATE_SEQ_3:
 	case INIT_STATE_SEQ_4:
 	case INIT_STATE_SEQ_5:

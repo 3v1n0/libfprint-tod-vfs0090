@@ -1236,18 +1236,24 @@ static void init_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case INIT_STATE_SEQ_2:
-		send_init_sequence(ssm, ssm->cur_state - INIT_STATE_SEQ_1);
-		if (vdev->buffer[vdev->buffer_length-1] != 0x07) {
-			fp_err("Sensor not initialized, init byte is 0x%x " \
-			       "(should be 0x07 on initialized devices, 0x02 " \
-			       "otherwise)\n" \
-			       "This is a driver in alpha state and the " \
-			       "device needs to be setup in a VirtualBox " \
-			       "instance running Windows first.",
-			       vdev->buffer[vdev->buffer_length-1]);
-			fpi_ssm_mark_aborted(ssm, -EIO);
+		if (vdev->buffer_length == 38) {
+			if (vdev->buffer[vdev->buffer_length-1] != 0x07) {
+				fp_err("Sensor not initialized, init byte is 0x%x " \
+				"(should be 0x07 on initialized devices, 0x02 " \
+				"otherwise)\n" \
+				"This is a driver in alpha state and the " \
+				"device needs to be setup in a VirtualBox " \
+				"instance running Windows first.",
+				vdev->buffer[vdev->buffer_length-1]);
+				fpi_ssm_mark_aborted(ssm, -EIO);
+				break;
+			}
+		} else {
+			fp_warn("Unknown reply at init stage %d, retrying...",
+			        ssm->cur_state);
+			fpi_ssm_jump_to_state(ssm, INIT_STATE_SEQ_1);
+			break;
 		}
-		break;
 	case INIT_STATE_SEQ_1:
 	case INIT_STATE_SEQ_3:
 	case INIT_STATE_SEQ_4:

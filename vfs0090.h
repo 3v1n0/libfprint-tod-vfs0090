@@ -243,7 +243,7 @@ static const struct data_exchange_t INIT_SEQUENCES[] = {
 		.msg = INIT_SEQUENCE_MSG1,
 		.msg_length = G_N_ELEMENTS(INIT_SEQUENCE_MSG1),
 		.rsp = NULL,
-		.rsp_length = 38,
+		.rsp_length = -1 /* 38 normally */,
 	},
 	{
 		.msg = INIT_SEQUENCE_MSG2,

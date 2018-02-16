@@ -906,7 +906,6 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 
 struct tls_handshake_t {
 	struct fp_img_dev *idev;
-	struct fpi_ssm *parent_ssm;
 
 	HASHContext *tls_hash_context;
 	HASHContext *tls_hash_context2;
@@ -921,7 +920,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 	struct tls_handshake_t *tlshd = ssm->priv;
 	struct fp_img_dev *idev = tlshd->idev;
 	struct vfs_dev_t *vdev = idev->priv;
-	struct vfs_init_t *vinit = tlshd->parent_ssm->priv;
+	struct vfs_init_t *vinit = ssm->parentsm->priv;
 
 	switch(ssm->cur_state) {
 	case TLS_HANDSHAKE_STATE_CLIENT_HELLO:
@@ -1101,7 +1100,7 @@ static void handshake_ssm(struct fpi_ssm *ssm)
 static void handshake_ssm_cb(struct fpi_ssm *ssm)
 {
 	struct tls_handshake_t *tlshd = ssm->priv;
-	struct fpi_ssm *parent_ssm = tlshd->parent_ssm;
+	struct fpi_ssm *parent_ssm = ssm->parentsm;
 	struct fp_img_dev *idev = tlshd->idev;
 
 	if (ssm->error) {
@@ -1125,9 +1124,9 @@ static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_
 
 	tlshd = g_new0(struct tls_handshake_t, 1);
 	tlshd->idev = idev;
-	tlshd->parent_ssm = parent_ssm;
 
 	ssm = fpi_ssm_new(idev->dev, handshake_ssm, TLS_HANDSHAKE_STATE_LAST);
+	ssm->parentsm = parent_ssm;
 	ssm->priv = tlshd;
 
 	fpi_ssm_start(ssm, handshake_ssm_cb);

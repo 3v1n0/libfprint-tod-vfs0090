@@ -37,12 +37,17 @@
 
 #include "vfs0090.h"
 
+#define IMG_DEV_FROM_SSM(ssm) ((struct fp_img_dev *) (ssm->dev->priv))
+#define VFS_DEV_FROM_IMG(img) ((struct vfs_dev_t *) img->priv)
+#define VFS_DEV_FROM_SSM(ssm) (VFS_DEV_FROM_IMG(IMG_DEV_FROM_SSM(ssm)))
+
 /* The main driver structure */
 struct vfs_dev_t {
 	/* Buffer for saving usb data through states */
 	unsigned char *buffer;
 	unsigned int buffer_length;
 
+	/* TLS keyblock for current session */
 	unsigned char key_block[0x120];
 
 	/* Current async transfer */
@@ -52,8 +57,6 @@ struct vfs_dev_t {
 };
 
 struct vfs_init_t {
-	struct fp_img_dev *idev;
-
 	unsigned char *main_seed;
 	unsigned int main_seed_length;
 	unsigned char pubkey[VFS_PUBLIC_KEY_SIZE];
@@ -508,6 +511,15 @@ static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 	return TRUE;
 }
 
+static void timeout_fpi_ssm_next_state(void *data)
+{
+	struct fpi_ssm *ssm = data;
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_SSM(ssm);
+
+	vdev->timeout = NULL;
+	fpi_ssm_next_state(ssm);
+}
+
 static PK11Context* hmac_make_context(const unsigned char *key_bytes, int key_len)
 {
 	PK11SymKey *pkKey;
@@ -906,8 +918,6 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 }
 
 struct tls_handshake_t {
-	struct fp_img_dev *idev;
-
 	HASHContext *tls_hash_context;
 	HASHContext *tls_hash_context2;
 	unsigned char read_buffer[VFS_USB_BUFFER_SIZE];
@@ -919,8 +929,8 @@ struct tls_handshake_t {
 static void handshake_ssm(struct fpi_ssm *ssm)
 {
 	struct tls_handshake_t *tlshd = ssm->priv;
-	struct fp_img_dev *idev = tlshd->idev;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 	struct vfs_init_t *vinit = ssm->parentsm->priv;
 
 	switch(ssm->cur_state) {
@@ -1102,7 +1112,7 @@ static void handshake_ssm_cb(struct fpi_ssm *ssm)
 {
 	struct tls_handshake_t *tlshd = ssm->priv;
 	struct fpi_ssm *parent_ssm = ssm->parentsm;
-	struct fp_img_dev *idev = tlshd->idev;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
 
 	if (ssm->error) {
 		fpi_imgdev_session_error(idev, ssm->error);
@@ -1120,15 +1130,11 @@ static void handshake_ssm_cb(struct fpi_ssm *ssm)
 
 static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm)
 {
-	struct tls_handshake_t *tlshd;
 	struct fpi_ssm *ssm;
-
-	tlshd = g_new0(struct tls_handshake_t, 1);
-	tlshd->idev = idev;
 
 	ssm = fpi_ssm_new(idev->dev, handshake_ssm, TLS_HANDSHAKE_STATE_LAST);
 	ssm->parentsm = parent_ssm;
-	ssm->priv = tlshd;
+	ssm->priv = g_new0(struct tls_handshake_t, 1);
 
 	fpi_ssm_start(ssm, handshake_ssm_cb);
 }
@@ -1209,8 +1215,7 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 
 static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
 {
-	struct vfs_init_t *vinit = ssm->priv;
-	struct fp_img_dev *idev = vinit->idev;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
 
 	do_data_exchange(idev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
 }
@@ -1219,8 +1224,8 @@ static void send_init_sequence(struct fpi_ssm *ssm, int sequence)
 static void init_ssm(struct fpi_ssm *ssm)
 {
 	struct vfs_init_t *vinit = ssm->priv;
-	struct fp_img_dev *idev = vinit->idev;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	switch (ssm->cur_state) {
 	case INIT_STATE_GENERATE_MAIN_SEED:
@@ -1305,8 +1310,8 @@ static void dev_open_callback(struct fpi_ssm *ssm)
 {
 	/* Notify open complete */
 	struct vfs_init_t *vinit = ssm->priv;
-	struct fp_img_dev *idev = vinit->idev;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
@@ -1326,7 +1331,6 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 {
 	struct fpi_ssm *ssm;
 	struct vfs_dev_t *vdev;
-	struct vfs_init_t *vinit;
 	SECStatus secs_status;
 
 	/* Claim usb interface */
@@ -1359,25 +1363,10 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 
 	/* Clearing previous device state */
 	ssm = fpi_ssm_new(idev->dev, init_ssm, INIT_STATE_LAST);
-
-	vinit = g_new0(struct vfs_init_t, 1);
-	vinit->idev = idev;
-
-	ssm->priv = vinit;
+	ssm->priv = g_new0(struct vfs_init_t, 1);
 	fpi_ssm_start(ssm, dev_open_callback);
 
 	return 0;
-}
-
-static void timeout_fpi_ssm_next_state(void *data)
-{
-	struct fpi_ssm *ssm = data;
-	struct fp_dev *dev = ssm->dev;
-	struct fp_img_dev *idev = dev->priv;
-	struct vfs_dev_t *vdev = idev->priv;
-
-	vdev->timeout = NULL;
-	fpi_ssm_next_state(ssm);
 }
 
 static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, void *data)
@@ -1395,7 +1384,6 @@ static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, voi
 }
 
 struct image_download_t {
-	struct fp_img_dev *idev;
 	struct fpi_ssm *ssm;
 
 	unsigned char image[144 * 144];
@@ -1405,8 +1393,8 @@ struct image_download_t {
 static void finger_image_download_callback(struct fpi_ssm *ssm)
 {
 	struct image_download_t *imgdown = ssm->priv;
-	struct fp_img_dev *idev = imgdown->idev;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	vdev->buffer_length = 0;
 	g_clear_pointer(&vdev->buffer, g_free);
@@ -1449,9 +1437,9 @@ static void finger_image_submit(struct fp_img_dev *idev, struct image_download_t
 
 static void finger_image_download_read_callback(struct fp_img_dev *idev, int status, void *data)
 {
-	struct image_download_t *imgdown = data;
-	struct fpi_ssm *ssm = imgdown->ssm;
-	struct vfs_dev_t *vdev = imgdown->idev->priv;
+	struct fpi_ssm *ssm = data;
+	struct image_download_t *imgdown = ssm->priv;
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_SSM(ssm);
 	int offset = (ssm->cur_state == IMAGE_DOWNLOAD_STATE_1) ? 0x12 : 0x06;
 	int data_size = vdev->buffer_length - offset;
 
@@ -1471,8 +1459,8 @@ static void finger_image_download_read_callback(struct fp_img_dev *idev, int sta
 static void finger_image_download_ssm(struct fpi_ssm *ssm)
 {
 	struct image_download_t *imgdown = ssm->priv;
-	struct fp_img_dev *idev = imgdown->idev;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	const unsigned char read_buffer_request[] = {
 		0x51, 0x00, 0x20, 0x00, 0x00
@@ -1488,7 +1476,7 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 				    vdev->buffer,
 				    VFS_IMAGE_SIZE * VFS_IMAGE_SIZE,
 				    finger_image_download_read_callback,
-				    imgdown);
+				    ssm);
 
 		break;
 
@@ -1538,9 +1526,7 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm)
 static void start_finger_image_download(struct fp_img_dev *idev)
 {
 	struct vfs_dev_t *vdev = idev->priv;
-	struct image_download_t *imgdown;
 	struct fpi_ssm *ssm;
-
 
 	vdev->buffer = g_malloc(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 	vdev->buffer_length = 0;
@@ -1548,12 +1534,7 @@ static void start_finger_image_download(struct fp_img_dev *idev)
 	ssm = fpi_ssm_new(idev->dev, finger_image_download_ssm,
 			  IMAGE_DOWNLOAD_STATE_LAST);
 
-	imgdown = g_new0(struct image_download_t, 1);
-	imgdown->idev = idev;
-	imgdown->ssm = ssm;
-
-	ssm->priv = imgdown;
-
+	ssm->priv = g_new0(struct image_download_t, 1);
 	fpi_ssm_start(ssm, finger_image_download_callback);
 }
 

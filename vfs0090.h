@@ -148,6 +148,8 @@ struct data_exchange_t {
 	int                  rsp_length;
 };
 
+const unsigned char TEST_SEED[] = "VirtualBox\0" "0";
+
 static const unsigned char INIT_SEQUENCE_MSG1[] = { 0x01 };
 
 static const unsigned char INIT_SEQUENCE_MSG2[] = { 0x19 };

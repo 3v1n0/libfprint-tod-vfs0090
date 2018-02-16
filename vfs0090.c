@@ -453,13 +453,6 @@ static void generate_main_seed(struct fp_img_dev *idev, struct vfs_init_t *vinit
 	FILE *name_file, *serial_file;
 	int name_len, serial_len;
 
-	/* The decoding doesn't work properly using generated Seeds yet */
-	const unsigned char test_seed[] = "VirtualBox\0" "0";
-	vinit->main_seed = g_malloc(sizeof(test_seed));
-	memcpy(vinit->main_seed, test_seed, sizeof(test_seed));
-	vinit->main_seed_length = sizeof(test_seed);
-	return;
-
 	if (!(name_file = fopen(DMI_PRODUCT_NAME_NODE, "r"))) {
 		fp_err("Can't open " DMI_PRODUCT_NAME_NODE);
 		fpi_imgdev_session_error(idev, -EIO);
@@ -1263,14 +1256,15 @@ static void init_ssm(struct fpi_ssm *ssm)
 				"otherwise)\n" \
 				"This is a driver in alpha state and the " \
 				"device needs to be setup in a VirtualBox " \
-				"instance running Windows first.",
+				"instance running Windows, or with a native " \
+				"Windows installation first.",
 				vdev->buffer[vdev->buffer_length-1]);
 				fpi_ssm_mark_aborted(ssm, -EIO);
 				break;
 			}
 		} else {
 			fp_warn("Unknown reply at init stage %d, retrying...",
-			        ssm->cur_state);
+				ssm->cur_state);
 			fpi_ssm_jump_to_state(ssm, INIT_STATE_SEQ_1);
 			break;
 		}
@@ -1293,6 +1287,16 @@ static void init_ssm(struct fpi_ssm *ssm)
 	case INIT_STATE_ECDSA_KEY:
 		if (make_ecdsa_key(vinit, vdev->buffer)) {
 			fpi_ssm_next_state(ssm);
+		} else if (memcmp(TEST_SEED, vinit->main_seed, vinit->main_seed_length) != 0) {
+			fp_warn("Failed using system seed for ECDSA key generation, "
+				"trying with a VirtualBox one\n");
+
+			g_clear_pointer(&vinit->main_seed, g_free);
+			vinit->main_seed = g_malloc(sizeof(TEST_SEED));
+			memcpy(vinit->main_seed, TEST_SEED, sizeof(TEST_SEED));
+			vinit->main_seed_length = sizeof(TEST_SEED);
+
+			fpi_ssm_jump_to_state(ssm, INIT_STATE_MASTER_KEY);
 		} else {
 			fp_err("Initialization failed at state %d, ECDSA key generation",
 			       ssm->cur_state);

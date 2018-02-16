@@ -130,6 +130,26 @@ struct async_usb_operation_data_t {
 	gboolean completed;
 };
 
+static int usb_error_to_fprint_fail(struct fp_img_dev *idev, int status)
+{
+	switch (idev->action) {
+	case IMG_ACTION_ENROLL:
+		status = FP_ENROLL_FAIL;
+		break;
+	case IMG_ACTION_VERIFY:
+	case IMG_ACTION_IDENTIFY:
+		status = FP_VERIFY_RETRY;
+		break;
+	case IMG_ACTION_CAPTURE:
+		status = FP_CAPTURE_FAIL;
+		break;
+	case IMG_ACTION_NONE:
+		break;
+	}
+
+	return status;
+}
+
 static gboolean async_transfer_completed(struct fp_img_dev *idev)
 {
 	struct async_usb_operation_data_t *op_data;
@@ -150,9 +170,14 @@ static void async_write_callback(struct libusb_transfer *transfer)
 
 	op_data->completed = TRUE;
 
+	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+		fp_info("USB write transfer cancelled");
+		goto out;
+	}
+
 	if (transfer->status != 0) {
 		fp_err("USB write transfer error: %s", libusb_error_name(transfer->status));
-		fpi_imgdev_session_error(idev, transfer->status);
+		fpi_imgdev_session_error(idev, -transfer->status);
 		goto out;
 	}
 
@@ -203,10 +228,15 @@ static void async_read_callback(struct libusb_transfer *transfer)
 
 	vdev->buffer_length = 0;
 
+	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+		fp_info("USB read transfer cancelled");
+		goto out;
+	}
+
 	if (transfer->status != 0) {
 		fp_err("USB read transfer error: %s",
 		       libusb_error_name(transfer->status));
-		fpi_imgdev_session_error(idev, transfer->status);
+		fpi_imgdev_session_error(idev, -transfer->status);
 		goto out;
 	}
 
@@ -403,7 +433,7 @@ static void async_transfer_callback_with_ssm(struct fp_img_dev *idev,
 	if (status == LIBUSB_TRANSFER_COMPLETED) {
 		fpi_ssm_next_state(ssm);
 	} else {
-		fpi_imgdev_session_error(idev, status);
+		fpi_imgdev_session_error(idev, -status);
 		fpi_ssm_mark_aborted(ssm, status);
 	}
 }
@@ -1546,8 +1576,13 @@ static void finger_scan_interrupt_callback(struct fp_img_dev *idev, int status, 
 	struct fpi_ssm *ssm = data;
 	int interrupt_type;
 
-	interrupt_type = translate_interrupt(vdev->buffer, vdev->buffer_length);
-	fpi_ssm_jump_to_state(ssm, interrupt_type);
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		interrupt_type = translate_interrupt(vdev->buffer,
+						     vdev->buffer_length);
+		fpi_ssm_jump_to_state(ssm, interrupt_type);
+	} else {
+		fpi_ssm_mark_aborted(ssm, usb_error_to_fprint_fail(idev, status));
+	}
 }
 
 static void finger_scan_ssm(struct fpi_ssm *ssm)
@@ -1656,15 +1691,20 @@ static void activate_device_interrupt_callback(struct fp_img_dev *idev, int stat
 	struct fpi_ssm *ssm = data;
 	int interrupt_type;
 
-	interrupt_type = translate_interrupt(vdev->buffer, vdev->buffer_length);
+	if (status == LIBUSB_TRANSFER_COMPLETED) {
+		interrupt_type = translate_interrupt(vdev->buffer,
+						     vdev->buffer_length);
 
-	if (interrupt_type == VFS_SCAN_WAITING_FOR_FINGER) {
-		fpi_ssm_next_state(ssm);
+		if (interrupt_type == VFS_SCAN_WAITING_FOR_FINGER) {
+			fpi_ssm_next_state(ssm);
+		} else {
+			fp_err("Unexpected device interrupt (%d) at this state",
+			       interrupt_type);
+			fpi_ssm_mark_aborted(ssm,
+					     usb_error_to_fprint_fail(idev, -EIO));
+		}
 	} else {
-		fp_err("Unexpected device interrupt (%d) at this state",
-		       interrupt_type);
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_aborted(ssm, -EIO);
+		fpi_ssm_mark_aborted(ssm, usb_error_to_fprint_fail(idev, -EIO));
 	}
 }
 
@@ -1772,8 +1812,20 @@ static void send_deactivate_sequence(struct fpi_ssm *ssm, int sequence)
 static void deactivate_ssm(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *idev = ssm->priv;
+	struct vfs_dev_t *vdev = idev->priv;
 
 	switch (ssm->cur_state) {
+	case DEACTIVATE_STOP_TRANSFER:
+		if (async_transfer_completed(idev)) {
+			fpi_ssm_next_state(ssm);
+			break;
+		}
+
+		g_clear_pointer(&vdev->transfer, libusb_cancel_transfer);
+		g_clear_pointer(&vdev->buffer, g_free);
+		fpi_timeout_add(50, (fpi_timeout_fn) fpi_ssm_mark_completed, ssm);
+		break;
+
 	case DEACTIVATE_STATE_SEQ_1:
 	case DEACTIVATE_STATE_SEQ_2:
 		send_deactivate_sequence(ssm, ssm->cur_state - DEACTIVATE_STATE_SEQ_1);

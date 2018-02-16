@@ -1584,10 +1584,13 @@ static void finger_scan_interrupt_callback(struct fp_img_dev *idev, int status, 
 	}
 }
 
+static void activate_ssm(struct fpi_ssm *ssm);
+
 static void finger_scan_ssm(struct fpi_ssm *ssm)
 {
 	struct fp_img_dev *idev = ssm->priv;
 	struct vfs_dev_t *vdev = idev->priv;
+	struct fpi_ssm *reactivate_ssm;
 
 	switch (ssm->cur_state) {
 	case SCAN_STATE_FINGER_ON_SENSOR:
@@ -1637,24 +1640,28 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case SCAN_STATE_HANDLE_SCAN_ERROR:
-		fpi_ssm_jump_to_state(ssm, SCAN_STATE_DO_LED_RED_BLINK);
+		fpi_imgdev_abort_scan(idev, ssm->error);
+		fpi_imgdev_report_finger_status(idev, FALSE);
+		fpi_ssm_jump_to_state(ssm, SCAN_STATE_LED_BLINK);
 		break;
 
-	case SCAN_STATE_DO_LED_RED_BLINK:
+	case SCAN_STATE_LED_BLINK:
 		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    led_blink_callback_with_ssm, ssm);
 		break;
 
-	case SCAN_STATE_AFTER_RED_BLINK:
-		fpi_ssm_mark_aborted(ssm, ssm->error);
+	case SCAN_STATE_REACTIVATE:
+		reactivate_ssm = fpi_ssm_new(idev->dev, activate_ssm, ACTIVATE_STATE_LAST);
+		reactivate_ssm->priv = idev;
+		fpi_ssm_start_subsm(ssm, reactivate_ssm);
 
-		/* We could actually retrying again by going back to
-		 * ACTIVATE_STATE_SEQ_1, that would need to split the
-		 * SSMs though, to repeat the activation states again
-		 * without informing the driver */
+		break;
 
+	case SCAN_STATE_REACTIVATION_DONE:
+		ssm->error = 0;
+		fpi_ssm_jump_to_state(ssm, SCAN_STATE_WAITING_FOR_FINGER);
 		break;
 
 	default:
@@ -1750,8 +1757,8 @@ static void dev_activate_callback(struct fpi_ssm *ssm)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	if (ssm->error) {
-		fp_err("Activation failed failed at state %d, unexpected"
-		       "device reply during initialization", ssm->cur_state);
+		fp_err("Activation failed failed at state %d, unexpected "
+		       "device reply during activation", ssm->cur_state);
 		fpi_imgdev_session_error(idev, ssm->error);
 	}
 

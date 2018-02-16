@@ -1822,12 +1822,17 @@ static void deactivate_ssm(struct fpi_ssm *ssm)
 
 		g_clear_pointer(&vdev->transfer, libusb_cancel_transfer);
 		g_clear_pointer(&vdev->buffer, g_free);
-		fpi_timeout_add(50, (fpi_timeout_fn) fpi_ssm_mark_completed, ssm);
+		fpi_ssm_jump_to_state(ssm, DEACTIVATE_STATE_LED_OFF);
 		break;
 
 	case DEACTIVATE_STATE_SEQ_1:
 	case DEACTIVATE_STATE_SEQ_2:
 		send_deactivate_sequence(ssm, ssm->cur_state - DEACTIVATE_STATE_SEQ_1);
+		break;
+
+	case DEACTIVATE_STATE_LED_OFF:
+		async_write_encrypted_to_usb(idev, LED_OFF, G_N_ELEMENTS(LED_OFF),
+					     async_transfer_callback_with_ssm, ssm);
 		break;
 
 	default:

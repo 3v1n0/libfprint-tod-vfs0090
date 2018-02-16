@@ -170,8 +170,8 @@ static void async_write_callback(struct libusb_transfer *transfer)
 
 	op_data->completed = TRUE;
 
-	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
-		fp_info("USB write transfer cancelled");
+	if (transfer->status == LIBUSB_TRANSFER_CANCELLED || !vdev->transfer) {
+		fp_dbg("USB write transfer cancelled");
 		goto out;
 	}
 
@@ -228,8 +228,8 @@ static void async_read_callback(struct libusb_transfer *transfer)
 
 	vdev->buffer_length = 0;
 
-	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
-		fp_info("USB read transfer cancelled");
+	if (transfer->status == LIBUSB_TRANSFER_CANCELLED || !vdev->transfer) {
+		fp_dbg("USB read transfer cancelled");
 		goto out;
 	}
 
@@ -1822,14 +1822,9 @@ static void deactivate_ssm(struct fpi_ssm *ssm)
 
 	switch (ssm->cur_state) {
 	case DEACTIVATE_STOP_TRANSFER:
-		if (async_transfer_completed(idev)) {
-			fpi_ssm_next_state(ssm);
-			break;
-		}
-
-		g_clear_pointer(&vdev->transfer, libusb_cancel_transfer);
-		g_clear_pointer(&vdev->buffer, g_free);
-		fpi_ssm_jump_to_state(ssm, DEACTIVATE_STATE_LED_OFF);
+		/* Using libusb_cancel_transfer should be better but not here */
+		vdev->transfer = NULL;
+		fpi_ssm_next_state(ssm);
 		break;
 
 	case DEACTIVATE_STATE_SEQ_1:
@@ -1838,8 +1833,10 @@ static void deactivate_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case DEACTIVATE_STATE_LED_OFF:
-		async_write_encrypted_to_usb(idev, LED_OFF, G_N_ELEMENTS(LED_OFF),
-					     async_transfer_callback_with_ssm, ssm);
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    LED_OFF, G_N_ELEMENTS(LED_OFF),
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    async_transfer_callback_with_ssm, ssm);
 		break;
 
 	default:

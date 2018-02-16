@@ -676,8 +676,6 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
 {
 	if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
-		fp_err("Expected len: %d, but got %d\n",
-		       dex->rsp_length, vdev->buffer_length);
 		return FALSE;
 	} else if (dex->rsp_length > 0 && dex->rsp != NULL) {
 		int i;
@@ -696,6 +694,22 @@ static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_ex
 	return TRUE;
 }
 
+static gboolean check_data_exchange_dbg(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
+{
+	gboolean ret = check_data_exchange(vdev, dex);
+
+	if (!ret) {
+		if (dex->rsp_length >= 0) {
+			fp_err("Expected len: %d, but got %d\n",
+			       dex->rsp_length, vdev->buffer_length);
+		}
+
+		print_hex(vdev->buffer, vdev->buffer_length);
+	}
+
+	return ret;
+}
+
 struct data_exchange_async_data_t {
 	struct fpi_ssm *ssm;
 	const struct data_exchange_t *dex;
@@ -707,7 +721,7 @@ static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 	struct vfs_dev_t *vdev = idev->priv;
 
 	if (status == LIBUSB_TRANSFER_COMPLETED) {
-		if (check_data_exchange(vdev, dex_data->dex)) {
+		if (check_data_exchange_dbg(vdev, dex_data->dex)) {
 			fpi_ssm_next_state(dex_data->ssm);
 		} else {
 			status = LIBUSB_TRANSFER_ERROR;
@@ -715,7 +729,8 @@ static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
 	}
 
 	if (status != LIBUSB_TRANSFER_COMPLETED) {
-		fp_err("Data exchange failed at state %d", dex_data->ssm->cur_state);
+		fp_err("Data exchange failed at state %d, usb error: %s",
+			dex_data->ssm->cur_state, libusb_error_name(status));
 		fpi_imgdev_session_error(idev, -EIO);
 		fpi_ssm_mark_aborted(dex_data->ssm, status);
 	}

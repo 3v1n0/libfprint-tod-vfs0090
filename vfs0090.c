@@ -39,7 +39,6 @@
 
 /* The main driver structure */
 struct vfs_dev_t {
-
 	/* Buffer for saving usb data through states */
 	unsigned char *buffer;
 	unsigned int buffer_length;
@@ -48,6 +47,8 @@ struct vfs_dev_t {
 
 	/* Current async transfer */
 	struct libusb_transfer *transfer;
+
+	struct fpi_timeout *timeout;
 };
 
 struct vfs_init_t {
@@ -1346,7 +1347,7 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	ERR_load_crypto_strings();
 
 	/* Initialize private structure */
-	vdev = g_malloc0(sizeof(struct vfs_dev_t));
+	vdev = g_new0(struct vfs_dev_t, 1);
 	idev->priv = vdev;
 
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
@@ -1355,7 +1356,6 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	usb_operation(libusb_reset_device(idev->udev), idev);
 	usb_operation(libusb_set_configuration(idev->udev, 1), idev);
 	usb_operation(libusb_claim_interface(idev->udev, 0), idev);
-
 
 	/* Clearing previous device state */
 	ssm = fpi_ssm_new(idev->dev, init_ssm, INIT_STATE_LAST);
@@ -1369,16 +1369,29 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	return 0;
 }
 
+static void timeout_fpi_ssm_next_state(void *data)
+{
+	struct fpi_ssm *ssm = data;
+	struct fp_dev *dev = ssm->dev;
+	struct fp_img_dev *idev = dev->priv;
+	struct vfs_dev_t *vdev = idev->priv;
+
+	vdev->timeout = NULL;
+	fpi_ssm_next_state(ssm);
+}
+
 static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, void *data)
 {
 	struct fpi_ssm *ssm = data;
+	struct vfs_dev_t *vdev = idev->priv;
 
 	if (status != LIBUSB_TRANSFER_COMPLETED) {
 		/* NO need to fail here, it's not a big issue... */
 		fp_err("LED blinking failed with error %d", status);
 	}
 
-	fpi_timeout_add(500, (fpi_timeout_fn) fpi_ssm_next_state, ssm);
+	vdev->timeout =
+		fpi_timeout_add(500, timeout_fpi_ssm_next_state, ssm);
 }
 
 struct image_download_t {
@@ -1532,7 +1545,8 @@ static void start_finger_image_download(struct fp_img_dev *idev)
 	vdev->buffer = g_malloc(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 	vdev->buffer_length = 0;
 
-	ssm = fpi_ssm_new(idev->dev, finger_image_download_ssm, IMAGE_DOWNLOAD_STATE_LAST);
+	ssm = fpi_ssm_new(idev->dev, finger_image_download_ssm,
+			  IMAGE_DOWNLOAD_STATE_LAST);
 
 	imgdown = g_new0(struct image_download_t, 1);
 	imgdown->idev = idev;
@@ -1640,16 +1654,22 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case SCAN_STATE_HANDLE_SCAN_ERROR:
-		fpi_imgdev_abort_scan(idev, ssm->error);
-		fpi_imgdev_report_finger_status(idev, FALSE);
-		fpi_ssm_jump_to_state(ssm, SCAN_STATE_LED_BLINK);
+		fpi_ssm_jump_to_state(ssm, SCAN_STATE_ERROR_LED_BLINK);
 		break;
 
-	case SCAN_STATE_LED_BLINK:
+	case SCAN_STATE_ERROR_LED_BLINK:
 		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    led_blink_callback_with_ssm, ssm);
+		break;
+
+	case SCAN_STATE_REACTIVATE_REQUEST:
+		vdev->timeout =
+			fpi_timeout_add(100, timeout_fpi_ssm_next_state, ssm);
+
+		fpi_imgdev_abort_scan(idev, ssm->error);
+		fpi_imgdev_report_finger_status(idev, FALSE);
 		break;
 
 	case SCAN_STATE_REACTIVATE:
@@ -1870,6 +1890,9 @@ static void dev_deactivate(struct fp_img_dev *idev)
 	struct vfs_dev_t *vdev = idev->priv;
 	struct fpi_ssm *ssm;
 
+	g_clear_pointer(&vdev->timeout, fpi_timeout_cancel);
+	g_clear_pointer(&vdev->buffer, g_free);
+
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
 
@@ -1892,7 +1915,6 @@ static void dev_close(struct fp_img_dev *idev)
 	vdev->buffer_length = 0;
 
 	g_free(idev->priv);
-	libusb_release_interface(idev->udev, 0);
 	fpi_imgdev_close_complete(idev);
 }
 

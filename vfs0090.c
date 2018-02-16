@@ -1735,6 +1735,7 @@ static void activate_device_interrupt_callback(struct fp_img_dev *idev, int stat
 		} else {
 			fp_err("Unexpected device interrupt (%d) at this state",
 			       interrupt_type);
+			print_hex(vdev->buffer, vdev->buffer_length);
 			fpi_ssm_mark_aborted(ssm,
 					     usb_error_to_fprint_fail(idev, -EIO));
 		}

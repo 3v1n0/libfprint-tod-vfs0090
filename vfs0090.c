@@ -37,6 +37,7 @@
 
 #include "vfs0090.h"
 
+#define STRINGIZE(s) #s
 #define IMG_DEV_FROM_SSM(ssm) ((struct fp_img_dev *) (ssm->dev->priv))
 #define VFS_DEV_FROM_IMG(img) ((struct vfs_dev_t *) img->priv)
 #define VFS_DEV_FROM_SSM(ssm) (VFS_DEV_FROM_IMG(IMG_DEV_FROM_SSM(ssm)))
@@ -485,10 +486,11 @@ static void generate_main_seed(struct fp_img_dev *idev, struct vfs_init_t *vinit
 	fclose(serial_file);
 }
 
-static gboolean usb_operation(int error, struct fp_img_dev *idev)
+#define usb_operation(func, dev) usb_operation_perform(STRINGIZE(func), func, idev)
+static gboolean usb_operation_perform(const char *op, int error, struct fp_img_dev *idev)
 {
 	if (error != 0) {
-		fp_err("USB operation failed: %s", libusb_error_name(error));
+		fp_err("USB operation '%s' failed: %s", op, libusb_error_name(error));
 		if (idev) {
 			fpi_imgdev_session_error(idev, -EIO);
 		}
@@ -1332,6 +1334,7 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	struct fpi_ssm *ssm;
 	struct vfs_dev_t *vdev;
 	SECStatus secs_status;
+	int usb_config;
 
 	/* Claim usb interface */
 	int error = libusb_claim_interface(idev->udev, 0);
@@ -1358,7 +1361,11 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	vdev->buffer_length = 0;
 
 	usb_operation(libusb_reset_device(idev->udev), idev);
-	usb_operation(libusb_set_configuration(idev->udev, 1), idev);
+	usb_operation(libusb_get_configuration(idev->udev, &usb_config), idev);
+
+	if (usb_config != 1)
+		usb_operation(libusb_set_configuration(idev->udev, 1), idev);
+
 	usb_operation(libusb_claim_interface(idev->udev, 0), idev);
 
 	/* Clearing previous device state */

@@ -38,6 +38,10 @@
 #include "vfs0090.h"
 
 #define STRINGIZE(s) #s
+
+#define EP_IN (1 | LIBUSB_ENDPOINT_IN)
+#define EP_OUT (1 | LIBUSB_ENDPOINT_OUT)
+#define EP_INTERRUPT (LIBUSB_TRANSFER_TYPE_INTERRUPT | LIBUSB_ENDPOINT_IN)
 #define IMG_DEV_FROM_SSM(ssm) ((struct fp_img_dev *) (ssm->dev->priv))
 #define VFS_DEV_FROM_IMG(img) ((struct vfs_dev_t *) img->priv)
 #define VFS_DEV_FROM_SSM(ssm) (VFS_DEV_FROM_IMG(IMG_DEV_FROM_SSM(ssm)))
@@ -219,7 +223,7 @@ static void async_write_to_usb(struct fp_img_dev *idev,
 	op_data->callback = callback;
 	op_data->callback_data = callback_data;
 
-	libusb_fill_bulk_transfer(vdev->transfer, idev->udev, 0x01,
+	libusb_fill_bulk_transfer(vdev->transfer, idev->udev, EP_OUT,
 				  (unsigned char *) data, data_size,
 				  async_write_callback, op_data, VFS_USB_TIMEOUT);
 	libusb_submit_transfer(vdev->transfer);
@@ -275,13 +279,14 @@ static void async_read_from_usb(struct fp_img_dev *idev, int read_mode,
 
 	switch (read_mode) {
 	case VFS_READ_INTERRUPT:
-		libusb_fill_interrupt_transfer(vdev->transfer, idev->udev, 0x83,
+		libusb_fill_interrupt_transfer(vdev->transfer, idev->udev,
+					       EP_INTERRUPT,
 					       buffer, buffer_size,
 					       async_read_callback, op_data,
 					       VFS_USB_INTERRUPT_TIMEOUT);
 		break;
 	case VFS_READ_BULK:
-		libusb_fill_bulk_transfer(vdev->transfer, idev->udev, 0x81,
+		libusb_fill_bulk_transfer(vdev->transfer, idev->udev, EP_IN,
 					  buffer, buffer_size,
 					  async_read_callback, op_data,
 					  VFS_USB_TIMEOUT);

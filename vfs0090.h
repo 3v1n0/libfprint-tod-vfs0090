@@ -658,8 +658,15 @@ static const struct data_exchange_t ACTIVATE_SEQUENCES[] = {
 		.msg = SCAN_MATRIX,
 		.msg_length = G_N_ELEMENTS(SCAN_MATRIX),
 		.rsp = NULL,
-		.rsp_length = 2366,
+		.rsp_length = -1 /* 2366 or 2 */,
 	},
+};
+
+const struct data_exchange_t MATRIX_ALREADY_ACTIVATED_DEX = {
+	.msg = SCAN_MATRIX,
+	.msg_length = G_N_ELEMENTS(SCAN_MATRIX),
+	.rsp = (unsigned char []) { 0x50, 0x04 },
+	.rsp_length = 2,
 };
 
 static const struct data_exchange_t DEACTIVATE_SEQUENCES[] = {

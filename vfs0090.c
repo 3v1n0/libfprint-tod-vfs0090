@@ -1768,6 +1768,11 @@ static void activate_ssm(struct fpi_ssm *ssm)
 		break;
 
 	case ACTIVATE_STATE_WAIT_DEVICE:
+		if (check_data_exchange(vdev, &MATRIX_ALREADY_ACTIVATED_DEX)) {
+			fpi_ssm_next_state(ssm);
+			break;
+		}
+
 		async_read_from_usb(idev, VFS_READ_INTERRUPT,
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    activate_device_interrupt_callback, ssm);

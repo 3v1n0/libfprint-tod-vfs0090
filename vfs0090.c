@@ -1634,7 +1634,7 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 	case SCAN_STATE_IN_PROGRESS:
 	case SCAN_STATE_COMPLETED:
 		async_read_from_usb(idev, VFS_READ_INTERRUPT,
-				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
 				    finger_scan_interrupt_callback, ssm);
 
 		break;
@@ -1785,7 +1785,7 @@ static void activate_ssm(struct fpi_ssm *ssm)
 		}
 
 		async_read_from_usb(idev, VFS_READ_INTERRUPT,
-				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
 				    activate_device_interrupt_callback, ssm);
 		break;
 

@@ -697,7 +697,7 @@ static gboolean check_data_exchange_dbg(struct vfs_dev_t *vdev, const struct dat
 	gboolean ret = check_data_exchange(vdev, dex);
 
 	if (!ret) {
-		if (dex->rsp_length >= 0) {
+		if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
 			fp_err("Expected len: %d, but got %d\n",
 			       dex->rsp_length, vdev->buffer_length);
 		}

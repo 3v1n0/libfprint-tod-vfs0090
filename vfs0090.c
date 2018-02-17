@@ -684,7 +684,9 @@ static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_ex
 				fp_warn("Reply mismatch, expected at char %d "
 					"(actual 0x%x, expected  0x%x)",
 					i, vdev->buffer[i], expected[i]);
-				return FALSE;
+
+				if (!dex->weak_match)
+					return FALSE;
 			}
 		}
 	}

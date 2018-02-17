@@ -142,6 +142,7 @@ enum DATA_EXCHANGE_MODE {
 };
 
 struct data_exchange_t {
+	gboolean             weak_match;
 	const unsigned char *msg;
 	int                  msg_length;
 	const unsigned char *rsp;
@@ -402,8 +403,8 @@ static const unsigned char ACTIVATE_SEQUENCE_MSG345[] = {
 	0x75
 };
 static const unsigned char ACTIVATE_SEQUENCE_RSP345[] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
-	0x71, 0x00
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+	0x71, 0x00                       /* 0x02 */
 };
 
 static const unsigned char ACTIVATE_SEQUENCE_MSG67[] = {

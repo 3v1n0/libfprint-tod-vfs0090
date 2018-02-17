@@ -404,8 +404,8 @@ static const unsigned char ACTIVATE_SEQUENCE_MSG345[] = {
 	0x75
 };
 static const unsigned char ACTIVATE_SEQUENCE_RSP345[] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-	0x71, 0x00                       /* 0x02 */
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+	0x71, 0x00                       /* 0x01 */
 };
 
 static const unsigned char ACTIVATE_SEQUENCE_MSG67[] = {
@@ -629,18 +629,21 @@ static const struct data_exchange_t ACTIVATE_SEQUENCES[] = {
 		.rsp_length = 6,
 	},
 	{
+		.weak_match = TRUE,
 		.msg = ACTIVATE_SEQUENCE_MSG345,
 		.msg_length = G_N_ELEMENTS(ACTIVATE_SEQUENCE_MSG345),
 		.rsp = ACTIVATE_SEQUENCE_RSP345,
 		.rsp_length = G_N_ELEMENTS(ACTIVATE_SEQUENCE_RSP345),
 	},
 	{
+		.weak_match = TRUE,
 		.msg = ACTIVATE_SEQUENCE_MSG345,
 		.msg_length = G_N_ELEMENTS(ACTIVATE_SEQUENCE_MSG345),
 		.rsp = ACTIVATE_SEQUENCE_RSP345,
 		.rsp_length = G_N_ELEMENTS(ACTIVATE_SEQUENCE_RSP345),
 	},
 	{
+		.weak_match = TRUE,
 		.msg = ACTIVATE_SEQUENCE_MSG345,
 		.msg_length = G_N_ELEMENTS(ACTIVATE_SEQUENCE_MSG345),
 		.rsp = ACTIVATE_SEQUENCE_RSP345,

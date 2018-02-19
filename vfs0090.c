@@ -1291,7 +1291,7 @@ static void init_ssm(struct fpi_ssm *ssm)
 			fpi_ssm_next_state(ssm);
 		} else if (memcmp(TEST_SEED, vinit->main_seed, vinit->main_seed_length) != 0) {
 			fp_warn("Failed using system seed for ECDSA key generation, "
-				"trying with a VirtualBox one\n");
+				"trying with a VirtualBox one");
 
 			g_clear_pointer(&vinit->main_seed, g_free);
 			vinit->main_seed = g_malloc(sizeof(TEST_SEED));
@@ -1579,8 +1579,8 @@ static void start_finger_image_download(struct fp_img_dev *idev)
 
 static void finger_scan_callback(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	if (ssm->error) {
 		fp_err("Scan failed failed at state %d, unexpected "
@@ -1622,9 +1622,9 @@ static void activate_ssm(struct fpi_ssm *ssm);
 
 static void finger_scan_ssm(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
-	struct vfs_dev_t *vdev = idev->priv;
 	struct fpi_ssm *reactivate_ssm;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	switch (ssm->cur_state) {
 	case SCAN_STATE_FINGER_ON_SENSOR:
@@ -1694,7 +1694,6 @@ static void finger_scan_ssm(struct fpi_ssm *ssm)
 
 	case SCAN_STATE_REACTIVATE:
 		reactivate_ssm = fpi_ssm_new(idev->dev, activate_ssm, ACTIVATE_STATE_LAST);
-		reactivate_ssm->priv = idev;
 		fpi_ssm_start_subsm(ssm, reactivate_ssm);
 
 		break;
@@ -1720,13 +1719,12 @@ static void start_finger_scan(struct fp_img_dev *idev)
 	vdev->buffer_length = 0;
 
 	ssm = fpi_ssm_new(idev->dev, finger_scan_ssm, SCAN_STATE_LAST);
-	ssm->priv = idev;
 	fpi_ssm_start(ssm, finger_scan_callback);
 }
 
 static void send_activate_sequence(struct fpi_ssm *ssm, int sequence)
 {
-	struct fp_img_dev *idev = ssm->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
 
 	do_data_exchange(idev, ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
@@ -1757,8 +1755,8 @@ static void activate_device_interrupt_callback(struct fp_img_dev *idev, int stat
 
 static void activate_ssm(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	switch (ssm->cur_state) {
 	case ACTIVATE_STATE_GREEN_LED_ON:
@@ -1799,8 +1797,8 @@ static void activate_ssm(struct fpi_ssm *ssm)
 /* Callback for dev_activate ssm */
 static void dev_activate_callback(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	if (ssm->error) {
 		fp_err("Activation failed failed at state %d, unexpected "
@@ -1829,7 +1827,6 @@ static int dev_activate(struct fp_img_dev *idev, enum fp_imgdev_state state)
 	vdev->buffer_length = 0;
 
 	ssm = fpi_ssm_new(idev->dev, activate_ssm, ACTIVATE_STATE_LAST);
-	ssm->priv = idev;
 	fpi_ssm_start(ssm, dev_activate_callback);
 
 	return 0;
@@ -1857,14 +1854,14 @@ static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state)
 
 static void send_deactivate_sequence(struct fpi_ssm *ssm, int sequence)
 {
-	struct fp_img_dev *idev = ssm->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
 	do_data_exchange(idev, ssm, &DEACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
 static void deactivate_ssm(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	switch (ssm->cur_state) {
 	case DEACTIVATE_STOP_TRANSFER:
@@ -1894,8 +1891,8 @@ static void deactivate_ssm(struct fpi_ssm *ssm)
 
 static void dev_deactivate_callback(struct fpi_ssm *ssm)
 {
-	struct fp_img_dev *idev = ssm->priv;
-	struct vfs_dev_t *vdev = idev->priv;
+	struct fp_img_dev *idev = IMG_DEV_FROM_SSM(ssm);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 
 	if (ssm->error) {
 		fp_err("Deactivation failed failed at state %d, unexpected "
@@ -1923,7 +1920,6 @@ static void dev_deactivate(struct fp_img_dev *idev)
 	vdev->buffer_length = 0;
 
 	ssm = fpi_ssm_new(idev->dev, deactivate_ssm, DEACTIVATE_STATE_LAST);
-	ssm->priv = idev;
 	fpi_ssm_start(ssm, dev_deactivate_callback);
 }
 

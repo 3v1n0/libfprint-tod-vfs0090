@@ -1857,8 +1857,14 @@ static void deactivate_ssm(struct fpi_ssm *ssm)
 
 	switch (ssm->cur_state) {
 	case DEACTIVATE_STOP_TRANSFER:
-		/* Using libusb_cancel_transfer should be better but not here */
-		vdev->transfer = NULL;
+		g_clear_pointer(&vdev->timeout, fpi_timeout_cancel);
+
+		if (vdev->transfer) {
+			/* Ignoring further callbacks, not ideal but safer */
+			vdev->transfer->callback = NULL;
+			g_clear_pointer(&vdev->transfer, libusb_cancel_transfer);
+		}
+
 		fpi_ssm_next_state(ssm);
 		break;
 

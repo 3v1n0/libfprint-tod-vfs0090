@@ -1368,14 +1368,6 @@ static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
 	SECStatus secs_status;
 	int usb_config;
 
-	/* Claim usb interface */
-	int error = libusb_claim_interface(idev->udev, 0);
-	if (error < 0) {
-		/* Interface not claimed, return error */
-		fp_err("could not claim interface 0");
-		return error;
-	}
-
 	secs_status = NSS_NoDB_Init(NULL);
 	if (secs_status != SECSuccess) {
 		fp_err("could not initialise NSS");

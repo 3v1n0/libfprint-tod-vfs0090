@@ -434,7 +434,7 @@ static void async_data_exchange(struct fp_img_dev *idev, int exchange_mode,
 	if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
 		async_write_to_usb(idev, data, data_size,
 				   on_async_data_exchange_cb, dex);
-	} else if (dex->exchange_mode) {
+	} else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED) {
 		async_write_encrypted_to_usb(idev, data, data_size,
 					     on_async_data_exchange_cb, dex);
 	} else {
@@ -573,16 +573,21 @@ static unsigned char* hmac_compute(const unsigned char *key, int key_len, unsign
 
 static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const unsigned char *data, int data_len, unsigned char **res, int *res_len) {
 	unsigned char *all_data, *hmac, *pad;
-	const unsigned char iv[] = {0x4b, 0x77, 0x62, 0xff, 0xa9, 0x03, 0xc1, 0x1e, 0x6f, 0xd8, 0x35, 0x93, 0x17, 0x2d, 0x54, 0xef};
+	const unsigned char iv[] = {
+		0x4b, 0x77, 0x62, 0xff, 0xa9, 0x03, 0xc1, 0x1e,
+		0x6f, 0xd8, 0x35, 0x93, 0x17, 0x2d, 0x54, 0xef
+	};
 
 	int prefix_len = (type != 0xFF) ? 5 : 0;
 
 	// header for hmac + data + hmac
 	all_data = malloc(prefix_len + data_len + 0x20);
-	all_data[0] = type; all_data[1] = all_data[2] = 0x03; all_data[3] = (data_len >> 8) & 0xFF; all_data[4] = data_len & 0xFF;
+	all_data[0] = type; all_data[1] = all_data[2] = 0x03;
+	all_data[3] = (data_len >> 8) & 0xFF;
+	all_data[4] = data_len & 0xFF;
 	memcpy(all_data + prefix_len, data, data_len);
 
-	hmac = hmac_compute(key_block + 0x00, 0x20, all_data, prefix_len + data_len);
+	hmac = hmac_compute(key_block, 0x20, all_data, prefix_len + data_len);
 	memcpy(all_data + prefix_len + data_len, hmac, 0x20);
 	free(hmac);
 
@@ -1127,7 +1132,8 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		const unsigned char WRONG_TLS_CERT_RSP[] = { 0x15, 0x03, 0x03, 0x00, 0x02 };
 
 		if (vdev->buffer_length < 50 ||
-		    memcmp (tlshd->read_buffer, WRONG_TLS_CERT_RSP, MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
+		    memcmp(tlshd->read_buffer, WRONG_TLS_CERT_RSP,
+		           MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
 			fp_err("TLS Certificate submitted isn't accepted by reader");
 			fpi_ssm_mark_failed(ssm, -EIO);
 			break;
@@ -1179,17 +1185,17 @@ static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_
 
 static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 {
+	const int expected_size = 5;
 	const unsigned char waiting_finger[] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
 	const unsigned char finger_down_prefix[] = { 0x02, 0x00, 0x40 };
-	const int finger_down_size = 5;
 	const unsigned char scanning_prints[] = { 0x03, 0x40, 0x01, 0x00, 0x00 };
 	const unsigned char scan_completed[] = { 0x03, 0x41, 0x03, 0x00, 0x40 };
 
-	const unsigned char desired_interrupt[] = { 0x03, 0x43, 0x04, 0x00, 0x41 };
-	const unsigned char low_quality_scan_interrupt[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
-	const unsigned char scan_failed_too_short_interrupt[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
-	const unsigned char scan_failed_too_short2_interrupt[] = { 0x03, 0x61, 0x07, 0x00, 0x41 };
-	const unsigned char scan_failed_too_fast_interrupt[] = { 0x03, 0x20, 0x07, 0x00, 0x00 };
+	const unsigned char scan_success[] = { 0x03, 0x43, 0x04, 0x00, 0x41 };
+	const unsigned char low_quality_scan[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
+	const unsigned char scan_failed_too_short[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
+	const unsigned char scan_failed_too_short2[] = { 0x03, 0x61, 0x07, 0x00, 0x41 };
+	const unsigned char scan_failed_too_fast[] = { 0x03, 0x20, 0x07, 0x00, 0x00 };
 
 	if (sizeof(waiting_finger) == interrupt_size &&
 		memcmp(waiting_finger, interrupt, interrupt_size) == 0) {
@@ -1197,7 +1203,7 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 		return VFS_SCAN_WAITING_FOR_FINGER;
 	}
 
-	if (finger_down_size == interrupt_size &&
+	if (expected_size == interrupt_size &&
 	     memcmp(finger_down_prefix, interrupt, sizeof(finger_down_prefix)) == 0) {
 		fp_info("Finger is on the sensor...");
 		return VFS_SCAN_FINGER_ON_SENSOR;
@@ -1215,32 +1221,33 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 		return VFS_SCAN_COMPLETED;
 	}
 
-	if (sizeof(desired_interrupt) == interrupt_size &&
-	    memcmp(desired_interrupt, interrupt, interrupt_size) == 0) {
+	if (sizeof(scan_success) == interrupt_size &&
+	    memcmp(scan_success, interrupt, interrupt_size) == 0) {
 		fp_info("Fingerprint scan success...");
 		return VFS_SCAN_SUCCESS;
 	}
 
-	if (sizeof(low_quality_scan_interrupt) == interrupt_size &&
-	    memcmp(low_quality_scan_interrupt, interrupt, interrupt_size) == 0) {
+	if (sizeof(low_quality_scan) == interrupt_size &&
+	    memcmp(low_quality_scan, interrupt, interrupt_size) == 0) {
+		fp_info("Fingerprint scan success, but low quality...");
 		printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
 		return VFS_SCAN_SUCCESS_LOW_QUALITY;
 	}
 
-	if (sizeof(scan_failed_too_short_interrupt) == interrupt_size &&
-	    memcmp(scan_failed_too_short_interrupt, interrupt, interrupt_size) == 0) {
+	if (sizeof(scan_failed_too_short) == interrupt_size &&
+	    memcmp(scan_failed_too_short, interrupt, interrupt_size) == 0) {
 		fp_err("Impossible to read fingerprint, don't move your finger");
 		return VFS_SCAN_FAILED_TOO_SHORT;
 	}
 
-	if (sizeof(scan_failed_too_short2_interrupt) == interrupt_size &&
-	    memcmp(scan_failed_too_short2_interrupt, interrupt, interrupt_size) == 0) {
+	if (sizeof(scan_failed_too_short2) == interrupt_size &&
+	    memcmp(scan_failed_too_short2, interrupt, interrupt_size) == 0) {
 		fp_err("Impossible to read fingerprint, don't move your finger (2)");
 		return VFS_SCAN_FAILED_TOO_SHORT;
 	}
 
-	if (sizeof(scan_failed_too_fast_interrupt) == interrupt_size &&
-	    memcmp(scan_failed_too_fast_interrupt, interrupt, interrupt_size) == 0) {
+	if (sizeof(scan_failed_too_fast) == interrupt_size &&
+	    memcmp(scan_failed_too_fast, interrupt, interrupt_size) == 0) {
 		fp_err("Impossible to read fingerprint, movement was too fast");
 		return VFS_SCAN_FAILED_TOO_FAST;
 	}
@@ -2009,8 +2016,8 @@ static void dev_close(struct fp_img_dev *idev)
 
 /* Usb id table of device */
 static const struct usb_id id_table[] = {
-	{.vendor = 0x138a,.product = 0x0090},
-	{0, 0, 0,},
+	{ .vendor = 0x138a, .product = 0x0090 },
+	{ 0, 0, 0, },
 };
 
 /* Device driver definition */

@@ -677,7 +677,7 @@ static const struct data_exchange_t ACTIVATE_SEQUENCES[] = {
 	},
 };
 
-const struct data_exchange_t MATRIX_ALREADY_ACTIVATED_DEX = {
+static const struct data_exchange_t MATRIX_ALREADY_ACTIVATED_DEX = {
 	.msg = SCAN_MATRIX,
 	.msg_length = G_N_ELEMENTS(SCAN_MATRIX),
 	.rsp = (unsigned char []) { 0x50, 0x04 },

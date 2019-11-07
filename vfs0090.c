@@ -1610,6 +1610,75 @@ static void start_finger_image_download_subsm(struct fp_img_dev *idev, struct fp
 	fpi_ssm_start(ssm, finger_image_download_callback);
 }
 
+struct scan_error_handler_data_t {
+	int error_code;
+	struct fpi_ssm *parent_ssm;
+};
+
+static void scan_error_handler_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+{
+	struct scan_error_handler_data_t *error_data = data;
+
+	if (fpi_ssm_get_error(ssm)) {
+		fp_err("Scan failed failed at state %d, unexpected "
+		       "device reply during scan error handling",
+		       fpi_ssm_get_cur_state(ssm));
+
+		fpi_ssm_mark_failed(error_data->parent_ssm,
+				    error_data->error_code);
+	} else {
+		fpi_ssm_jump_to_state(error_data->parent_ssm,
+				      SCAN_STATE_WAITING_FOR_FINGER);
+	}
+
+	g_free(error_data);
+	fpi_ssm_free(ssm);
+}
+
+static void scan_error_handler_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+{
+	struct fp_img_dev *idev = FP_IMG_DEV(dev);
+	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	struct scan_error_handler_data_t *error_data = data;
+
+	switch (fpi_ssm_get_cur_state(ssm)) {
+	case SCAN_ERROR_STATE_LED_BLINK:
+		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
+				    vdev->buffer, VFS_USB_BUFFER_SIZE,
+				    led_blink_callback_with_ssm, ssm);
+		break;
+
+	case SCAN_ERROR_STATE_REACTIVATE_REQUEST:
+		start_reactivate_subsm(idev, ssm);
+
+		if (fpi_ssm_get_error(ssm))
+			fpi_imgdev_abort_scan(idev, error_data->error_code);
+
+		fpi_imgdev_report_finger_status(idev, FALSE);
+		break;
+
+	default:
+		fp_err("Unknown scan state");
+		fpi_imgdev_session_error(idev, -EIO);
+		fpi_ssm_mark_failed(ssm, -EIO);
+	}
+}
+
+static void start_scan_error_handler_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm, int error_code)
+{
+	struct scan_error_handler_data_t *error_data;
+	struct fpi_ssm *ssm;
+
+	error_data = g_new0(struct scan_error_handler_data_t, 1);
+	error_data->error_code = error_code;
+	error_data->parent_ssm = parent_ssm;
+
+	ssm = fpi_ssm_new(FP_DEV(idev), scan_error_handler_ssm,
+			  SCAN_ERROR_STATE_LAST, error_data);
+	fpi_ssm_start(ssm, scan_error_handler_callback);
+}
+
 static void finger_scan_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 {
 	struct fp_img_dev *idev = FP_IMG_DEV(dev);
@@ -1654,6 +1723,7 @@ static void finger_scan_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 {
 	struct fp_img_dev *idev = FP_IMG_DEV(dev);
 	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	int error_code;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case SCAN_STATE_FINGER_ON_SENSOR:
@@ -1672,59 +1742,34 @@ static void finger_scan_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 	case SCAN_STATE_FAILED_TOO_FAST:
 		switch (fpi_imgdev_get_action(idev)) {
 		case IMG_ACTION_ENROLL:
-			fpi_ssm_set_error(ssm, FP_ENROLL_RETRY_TOO_SHORT);
+			error_code = FP_ENROLL_RETRY_TOO_SHORT;
 			break;
 		case IMG_ACTION_VERIFY:
 		case IMG_ACTION_IDENTIFY:
-			fpi_ssm_set_error(ssm, FP_VERIFY_RETRY_TOO_SHORT);
+			error_code = FP_VERIFY_RETRY_TOO_SHORT;
 			break;
 		case IMG_ACTION_CAPTURE:
-			fpi_ssm_set_error(ssm, FP_CAPTURE_FAIL);
+			error_code = FP_CAPTURE_FAIL;
 			break;
 		default:
-			fpi_ssm_set_error(ssm, -1);
+			error_code = -1;
 		}
 
-		fpi_ssm_jump_to_state(ssm, SCAN_STATE_HANDLE_SCAN_ERROR);
+		start_scan_error_handler_ssm(idev, ssm, error_code);
 		break;
 
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
 		if (fpi_imgdev_get_action(idev) == IMG_ACTION_ENROLL) {
-			fpi_ssm_set_error(ssm, FP_ENROLL_RETRY_CENTER_FINGER);
-			fpi_ssm_jump_to_state(ssm, SCAN_STATE_HANDLE_SCAN_ERROR);
-			break;
+			error_code = FP_ENROLL_RETRY_CENTER_FINGER;
+			start_scan_error_handler_ssm(idev, ssm, error_code);
 		} else if (fpi_imgdev_get_action(idev) == IMG_ACTION_VERIFY) {
 			fp_warn("Low quality image in verification, might fail");
+			fpi_ssm_jump_to_state(ssm, SCAN_STATE_SUCCESS);
 		}
+		break;
 
 	case SCAN_STATE_SUCCESS:
 		start_finger_image_download_subsm(idev, ssm);
-
-		break;
-
-	case SCAN_STATE_HANDLE_SCAN_ERROR:
-		fpi_ssm_jump_to_state(ssm, SCAN_STATE_ERROR_LED_BLINK);
-		break;
-
-	case SCAN_STATE_ERROR_LED_BLINK:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
-				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
-				    vdev->buffer, VFS_USB_BUFFER_SIZE,
-				    led_blink_callback_with_ssm, ssm);
-		break;
-
-	case SCAN_STATE_REACTIVATE_REQUEST:
-		start_reactivate_subsm(idev, ssm);
-
-		if (fpi_ssm_get_error(ssm))
-			fpi_imgdev_abort_scan(idev, fpi_ssm_get_error(ssm));
-
-		fpi_imgdev_report_finger_status(idev, FALSE);
-		break;
-
-	case SCAN_STATE_REACTIVATION_DONE:
-		fpi_ssm_set_error(ssm, 0);
-		fpi_ssm_jump_to_state(ssm, SCAN_STATE_WAITING_FOR_FINGER);
 		break;
 
 	default:
@@ -1779,7 +1824,7 @@ static void activate_device_interrupt_callback(struct fp_img_dev *idev, int stat
 			       interrupt_type);
 			print_hex(vdev->buffer, vdev->buffer_length);
 			fpi_ssm_mark_failed(ssm,
-					     usb_error_to_fprint_fail(idev, -EIO));
+					    usb_error_to_fprint_fail(idev, -EIO));
 		}
 	} else {
 		fpi_ssm_mark_failed(ssm, usb_error_to_fprint_fail(idev, status));

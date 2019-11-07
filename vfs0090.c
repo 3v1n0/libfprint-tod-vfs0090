@@ -20,8 +20,8 @@
 
 #define FP_COMPONENT "vfs0090"
 
+#include "drivers_api.h"
 #include <fp_internal.h>
-#include <drivers_api.h>
 
 #include <errno.h>
 #include <nss.h>
@@ -512,6 +512,7 @@ static gboolean usb_operation_perform(const char *op, int error, struct fp_img_d
 	return TRUE;
 }
 
+/*
 static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 {
 	if (ret != TRUE) {
@@ -524,6 +525,7 @@ static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 
 	return TRUE;
 }
+*/
 
 static void timeout_fpi_ssm_next_state(struct fp_dev *dev, void *data)
 {
@@ -1849,7 +1851,7 @@ static void dev_activate_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void 
 	fpi_ssm_free(ssm);
 }
 
-static int dev_activate(struct fp_img_dev *idev, enum fp_imgdev_state state)
+static int dev_activate(struct fp_img_dev *idev)
 {
 	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
 	struct fpi_ssm *ssm;

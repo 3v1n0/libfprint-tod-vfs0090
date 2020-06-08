@@ -928,7 +928,6 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 }
 
 struct tls_handshake_t {
-	FpiSsm *parent_ssm;
 	struct vfs_init_t *vinit;
 	HASHContext *tls_hash_context;
 	HASHContext *tls_hash_context2;
@@ -1127,18 +1126,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 	}
 }
 
-static void handshake_ssm_cb(FpiSsm *ssm, FpDevice *dev, GError *error)
-{
-	struct tls_handshake_t *tlshd = fpi_ssm_get_data(ssm);
-	FpiSsm *parent_ssm = tlshd->parent_ssm;
-
-	if (error) {
-		fpi_ssm_mark_failed(parent_ssm, error);
-	} else {
-		fpi_ssm_next_state(parent_ssm);
-	}
-}
-
 static void start_handshake_ssm(FpImageDevice *idev,
 				FpiSsm *parent_ssm,
 				struct vfs_init_t *vinit)
@@ -1147,13 +1134,12 @@ static void start_handshake_ssm(FpImageDevice *idev,
 	struct tls_handshake_t *tlshd;
 
 	tlshd = g_new0(struct tls_handshake_t, 1);
-	tlshd->parent_ssm = parent_ssm;
 	tlshd->vinit = vinit;
 
 	ssm = fpi_ssm_new(FP_DEVICE(idev), handshake_ssm,
 			  TLS_HANDSHAKE_STATE_LAST);
 	fpi_ssm_set_data(ssm, tlshd, (GDestroyNotify) tls_handshake_free);
-	fpi_ssm_start(ssm, handshake_ssm_cb);
+	fpi_ssm_start_subsm(parent_ssm, ssm);
 }
 
 static int translate_interrupt(unsigned char *interrupt, int interrupt_size)

@@ -158,7 +158,6 @@ static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
 
 	if (error) {
 		fp_err("USB write transfer error: %s", error->message);
-		fpi_device_action_error(device, error);
 		goto out;
 	}
 
@@ -168,13 +167,13 @@ static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
 						  transfer->length,
 						  transfer->actual_length);
 		fp_err("%s", error->message);
-		fpi_device_action_error(device, error);
-		goto out;
 	}
 
 out:
 	if (op_data->callback)
 		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
+	else if (error)
+		fpi_image_device_session_error(FP_IMAGE_DEVICE(device), error);
 
 	g_free(op_data);
 }
@@ -222,7 +221,6 @@ static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
 	if (error) {
 		fp_err("USB read transfer error: %s",
 		       error->message);
-		fpi_device_action_error(device, error);
 		goto out;
 	}
 
@@ -231,6 +229,8 @@ static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
 out:
 	if (op_data->callback)
 		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
+	else if (error)
+		fpi_image_device_session_error(FP_IMAGE_DEVICE(device), error);
 
 	g_free(op_data);
 }
@@ -412,7 +412,11 @@ static void async_data_exchange(FpImageDevice *idev, int exchange_mode,
 		GError *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
 							 "Unknown exchange mode selected");
 		fp_err("%s", error->message);
-		fpi_device_action_error(FP_DEVICE(idev), error);
+
+		if (callback)
+			callback(idev, callback_data, error);
+		else
+			fpi_image_device_session_error(idev, error);
 	}
 }
 
@@ -423,7 +427,6 @@ static void async_transfer_callback_with_ssm(FpImageDevice *idev, gpointer data,
 	if (!error) {
 		fpi_ssm_next_state(ssm);
 	} else {
-		fpi_device_action_error(FP_DEVICE(idev), error);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -726,11 +729,11 @@ static void on_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *erro
 		}
 	}
 
-	if (error) {
-		fp_err("Data exchange failed at state %d, usb error: %s",
-			fpi_ssm_get_cur_state(dex_data->ssm), error->message);
-		if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-			fpi_image_device_session_error(idev, error);
+  if (error) {
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+			fp_err("Data exchange failed at state %d, usb error: %s",
+			       fpi_ssm_get_cur_state(dex_data->ssm), error->message);
+		}
 
 		fpi_ssm_mark_failed(dex_data->ssm, error);
 	}
@@ -1365,10 +1368,11 @@ static void dev_open_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
 	struct vfs_init_t *vinit = fpi_ssm_get_data(ssm);
 
-	if (fpi_ssm_get_error(ssm))
+	if (error)
 		fpi_image_device_session_error(idev, error);
 
-	fpi_image_device_open_complete(idev, error);
+	if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+		fpi_image_device_open_complete(idev, error);
 
 	g_free(vinit->main_seed);
 	g_free(vinit);
@@ -1448,11 +1452,15 @@ static void finger_image_download_callback(FpiSsm *ssm, FpDevice *dev, GError *e
 {
 	struct image_download_t *imgdown = fpi_ssm_get_data(ssm);
 
-	if (!fpi_ssm_get_error(ssm)) {
+	if (!error) {
 		fpi_ssm_mark_completed(imgdown->parent_ssm);
 	} else {
-		fp_err("Scan failed failed at state %d, unexpected"
-		       "device reply during image download", fpi_ssm_get_cur_state(ssm));
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+			fp_err("Scan failed failed at state %d, unexpected"
+			       "device reply during image download",
+			       fpi_ssm_get_cur_state(ssm));
+		}
+
 		fpi_ssm_mark_failed(imgdown->parent_ssm, error);
 	}
 
@@ -1489,9 +1497,6 @@ static void finger_image_download_read_callback(FpImageDevice *idev, gpointer da
 
 	if (error) {
 		fp_err("Image download failed at state %d", fpi_ssm_get_cur_state(ssm));
-		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-			fpi_device_action_error(FP_DEVICE(idev), error);
-
 		fpi_ssm_mark_failed(ssm, error);
 		return;
 	}
@@ -1613,10 +1618,14 @@ static void scan_error_handler_callback(FpiSsm *ssm, FpDevice *dev, GError *erro
 {
 	struct scan_error_handler_data_t *error_data = fpi_ssm_get_data (ssm);
 
-	if (fpi_ssm_get_error(ssm)) {
-		fp_err("Scan failed failed at state %d, unexpected "
-		       "device reply during scan error handling",
-		       fpi_ssm_get_cur_state(ssm));
+	if (error) {
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+			fp_err("Scan failed failed at state %d, unexpected "
+			       "device reply during scan error handling",
+			       fpi_ssm_get_cur_state(ssm));
+		}
+
+		fpi_ssm_mark_failed(error_data->parent_ssm, error);
 	} else {
 		fpi_image_device_retry_scan(FP_IMAGE_DEVICE(dev),
 					    error_data->retry);
@@ -1678,16 +1687,13 @@ static void finger_scan_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
 
-	if (fpi_ssm_get_error(ssm)) {
+	if (error && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 		fp_err("Scan failed failed at state %d, unexpected "
 		       "device reply during finger scanning", fpi_ssm_get_cur_state(ssm));
 
-		if (fpi_ssm_get_cur_state(ssm) > SCAN_STATE_FINGER_ON_SENSOR) {
-			fpi_image_device_session_error(idev, error);
-			fpi_image_device_report_finger_status(idev, FALSE);
-		} else {
-			fpi_image_device_session_error(idev, error);
-		}
+		fpi_image_device_session_error(idev, error);
+	} else {
+		g_clear_error(&error);
 	}
 }
 
@@ -1701,8 +1707,6 @@ static void finger_scan_interrupt_callback(FpImageDevice *idev, gpointer data, G
 		interrupt_type = translate_interrupt(vdev->buffer,
 						     vdev->buffer_length);
 		fpi_ssm_jump_to_state(ssm, interrupt_type);
-	} else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-		fpi_ssm_mark_completed(ssm);
 	} else {
 		fpi_ssm_mark_failed(ssm, error);
 	}
@@ -1788,7 +1792,7 @@ static void activate_device_interrupt_callback(FpImageDevice *idev, gpointer dat
 				fpi_ssm_next_state(ssm);
 			}
 		} else {
-			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
 							 "Unexpected device interrupt "
 							 "(%d) at this state",
 							 interrupt_type);
@@ -1848,10 +1852,9 @@ static void dev_activate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
 
-	if (fpi_ssm_get_error(ssm)) {
+	if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED) && error) {
 		fp_err("Activation failed failed at state %d, unexpected "
 		       "device reply during activation", fpi_ssm_get_cur_state(ssm));
-		fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
 	}
 
 	fpi_image_device_activate_complete(idev, fpi_ssm_get_error(ssm));
@@ -1912,13 +1915,16 @@ static void dev_deactivate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
 	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
-	if (fpi_ssm_get_error(ssm)) {
-		fp_err("Deactivation failed failed at state %d, unexpected "
-		       "device reply during deactivation", fpi_ssm_get_cur_state(ssm));
-		fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
+	if (error) {
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+			fp_err("Deactivation failed at state %d, unexpected "
+			       "device reply during deactivation",
+			       fpi_ssm_get_cur_state(ssm));
+		}
+
+		fpi_image_device_session_error(idev, error);
 	}
 
-	g_cancellable_cancel(vdev->cancellable);
 	g_clear_object(&vdev->cancellable);
 
 	fpi_image_device_deactivate_complete(idev, NULL);

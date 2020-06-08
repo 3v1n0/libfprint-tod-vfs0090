@@ -76,6 +76,12 @@ struct vfs_init_t {
 	unsigned char tls_certificate[G_N_ELEMENTS(TLS_CERTIFICATE_BASE)];
 };
 
+static void vfs_init_free(struct vfs_init_t *vinit)
+{
+	g_clear_pointer(&vinit->main_seed, g_free);
+	g_free(vinit);
+}
+
 /* DEBUGGG */
 #include <stdio.h>
 
@@ -146,7 +152,7 @@ struct async_usb_operation_data_t {
 static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
 				 gpointer user_data, GError *error)
 {
-	struct async_usb_operation_data_t *op_data = user_data;
+	g_autofree struct async_usb_operation_data_t *op_data = user_data;
 	FpiDeviceVfs0090 *vdev;
 
 	if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
@@ -171,12 +177,10 @@ static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
 	}
 
 out:
-	if (op_data->callback)
+	if (op_data && op_data->callback)
 		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
 	else if (error)
 		fpi_image_device_session_error(FP_IMAGE_DEVICE(device), error);
-
-	g_free(op_data);
 }
 
 static void async_write_to_usb(FpImageDevice *idev,
@@ -207,7 +211,7 @@ static void async_write_to_usb(FpImageDevice *idev,
 static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
 				gpointer user_data, GError *error)
 {
-	struct async_usb_operation_data_t *op_data = user_data;
+	g_autofree struct async_usb_operation_data_t *op_data = user_data;
 	FpiDeviceVfs0090 *vdev;
 
 	if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
@@ -228,12 +232,10 @@ static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
 	vdev->buffer_length = transfer->actual_length;
 
 out:
-	if (op_data->callback)
+	if (op_data && op_data->callback)
 		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
 	else if (error)
 		fpi_image_device_session_error(FP_IMAGE_DEVICE(device), error);
-
-	g_free(op_data);
 }
 
 static void async_read_from_usb(FpImageDevice *idev, FpiTransferType transfer_type,
@@ -285,13 +287,12 @@ struct async_usb_encrypted_operation_data_t {
 
 static void async_write_encrypted_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct async_usb_encrypted_operation_data_t *enc_op = data;
+	g_autofree struct async_usb_encrypted_operation_data_t *enc_op = data;
 
 	if (enc_op->callback)
 		enc_op->callback(idev, enc_op->callback_data, error);
 
-	free(enc_op->encrypted_data);
-	free(enc_op);
+	g_clear_pointer(&enc_op->encrypted_data, g_free);
 }
 
 static void async_write_encrypted_to_usb(FpImageDevice *idev,
@@ -319,7 +320,7 @@ static void async_write_encrypted_to_usb(FpImageDevice *idev,
 
 static void async_read_encrypted_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct async_usb_encrypted_operation_data_t *enc_op = data;
+	g_autofree struct async_usb_encrypted_operation_data_t *enc_op = data;
 	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	enc_op->encrypted_data = g_memdup(vdev->buffer, vdev->buffer_length);
@@ -338,8 +339,7 @@ static void async_read_encrypted_callback(FpImageDevice *idev, gpointer data, GE
 	if (enc_op->callback)
 		enc_op->callback(idev, enc_op->callback_data, error);
 
-	free(enc_op->encrypted_data);
-	free(enc_op);
+	g_clear_pointer(&enc_op->encrypted_data, g_free);
 }
 
 static void async_read_decrypt_from_usb(FpImageDevice *idev, FpiTransferType transfer_type,
@@ -367,7 +367,9 @@ struct async_data_exchange_t {
 
 static void on_async_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct async_data_exchange_t *dex = data;
+	g_autofree struct async_data_exchange_t *dex = data;
+
+	g_assert_nonnull(dex);
 
 	if (!error) {
 		if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
@@ -385,8 +387,6 @@ static void on_async_data_exchange_cb(FpImageDevice *idev, gpointer data, GError
 	} else if (dex->callback) {
 		dex->callback(idev, dex->callback_data, error);
 	}
-
-	g_free(dex);
 }
 
 static void async_data_exchange(FpImageDevice *idev, int exchange_mode,
@@ -546,7 +546,7 @@ static unsigned char* hmac_compute(const unsigned char *key, int key_len, unsign
 	PK11_DigestOp(context, data, data_len);
 
 	unsigned int len = 0x20;
-	unsigned char *res = malloc(len);
+	unsigned char *res = g_malloc(len);
 	PK11_DigestFinal(context, res, &len, len);
 	PK11_DestroyContext(context, PR_TRUE);
 
@@ -554,7 +554,9 @@ static unsigned char* hmac_compute(const unsigned char *key, int key_len, unsign
 }
 
 static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const unsigned char *data, int data_len, unsigned char **res, int *res_len) {
-	unsigned char *all_data, *hmac, *pad;
+	g_autofree unsigned char *all_data = NULL;
+	g_autofree unsigned char *hmac = NULL;
+	g_autofree unsigned char *pad = NULL;
 	const unsigned char iv[] = {
 		0x4b, 0x77, 0x62, 0xff, 0xa9, 0x03, 0xc1, 0x1e,
 		0x6f, 0xd8, 0x35, 0x93, 0x17, 0x2d, 0x54, 0xef
@@ -563,7 +565,7 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	int prefix_len = (type != 0xFF) ? 5 : 0;
 
 	// header for hmac + data + hmac
-	all_data = malloc(prefix_len + data_len + 0x20);
+	all_data = g_malloc(prefix_len + data_len + 0x20);
 	all_data[0] = type; all_data[1] = all_data[2] = 0x03;
 	all_data[3] = (data_len >> 8) & 0xFF;
 	all_data[4] = data_len & 0xFF;
@@ -571,14 +573,13 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 
 	hmac = hmac_compute(key_block, 0x20, all_data, prefix_len + data_len);
 	memcpy(all_data + prefix_len + data_len, hmac, 0x20);
-	free(hmac);
 
 	EVP_CIPHER_CTX *context = EVP_CIPHER_CTX_new();
 	EVP_EncryptInit(context, EVP_aes_256_cbc(), key_block + 0x40, iv);
 	EVP_CIPHER_CTX_set_padding(context, 0);
 
 	*res_len = ((data_len + 16) / 16) * 16 + 0x30;
-	*res = malloc(*res_len);
+	*res = g_malloc(*res_len);
 	memcpy(*res, iv, 0x10);
 	int written = 0, wr2, wr3 = 0;
 
@@ -588,16 +589,13 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	if (pad_len == 0) {
 		pad_len = 16;
 	}
-	pad = malloc(pad_len);
+	pad = g_malloc(pad_len);
 	memset(pad, pad_len - 1, pad_len);
 
 	EVP_EncryptUpdate(context, *res + 0x10 + written, &wr3, pad, pad_len);
 
 	EVP_EncryptFinal(context, *res + 0x10 + written + wr3, &wr2);
 	*res_len = written + wr2 + wr3 + 0x10;
-
-	free(all_data);
-	free(pad);
 
 	EVP_CIPHER_CTX_free(context);
 }
@@ -606,7 +604,8 @@ static unsigned char *tls_encrypt(FpImageDevice *idev,
 				  const unsigned char *data, int data_size,
 				  int *encrypted_len_out) {
 	FpiDeviceVfs0090 *vdev;
-	unsigned char *res, *wr;
+	g_autofree unsigned char *res = NULL;
+	unsigned char *wr;
 	int res_len;
 
 	vdev = FPI_DEVICE_VFS0090(idev);
@@ -614,13 +613,11 @@ static unsigned char *tls_encrypt(FpImageDevice *idev,
 
 	mac_then_encrypt(0x17, vdev->key_block, data, data_size, &res, &res_len);
 
-	wr = malloc(res_len + 5);
+	wr = g_malloc(res_len + 5);
 	memcpy(wr + 5, res, res_len);
 	wr[0] = 0x17; wr[1] = wr[2] = 0x03; wr[3] = res_len >> 8; wr[4] = res_len & 0xFF;
 
 	*encrypted_len_out = res_len + 5;
-
-	free(res);
 
 	return wr;
 }
@@ -719,7 +716,7 @@ struct data_exchange_async_data_t {
 
 static void on_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct data_exchange_async_data_t *dex_data = data;
+	g_autofree struct data_exchange_async_data_t *dex_data = data;
 	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	if (!error) {
@@ -738,8 +735,6 @@ static void on_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *erro
 
 		fpi_ssm_mark_failed(dex_data->ssm, error);
 	}
-
-	g_free(dex_data);
 }
 
 static void do_data_exchange(FpImageDevice *idev, FpiSsm *ssm,
@@ -764,27 +759,30 @@ static void TLS_PRF2(const unsigned char *secret, int secret_len, const char *st
 	int total_len = 0;
 	int str_len = strlen(str);
 	unsigned char seed[str_len + seed40_len];
+	int seed_len = str_len + seed40_len;
+	g_autofree unsigned char *a = NULL;
+
 	memcpy(seed, str, str_len);
 	memcpy(seed + str_len, seed40, seed40_len);
-	int seed_len = str_len + seed40_len;
-	unsigned char *a = hmac_compute(secret, secret_len, seed, seed_len);
+
+	a = hmac_compute(secret, secret_len, seed, seed_len);
 
 	while (total_len < buffer_len) {
 		unsigned char buffer[0x20 + seed_len];
+		g_autofree unsigned char *p = NULL;
+		g_autofree unsigned char *t = NULL;
+
 		memcpy(buffer, a, 0x20);
 		memcpy(buffer + 0x20, seed, seed_len);
 
-		unsigned char *p = hmac_compute(secret, secret_len, buffer, 0x20 + seed_len);
+		p = hmac_compute(secret, secret_len, buffer, 0x20 + seed_len);
 		memcpy(out_buffer + total_len, p, MIN(0x20, buffer_len - total_len));
-		free(p);
 
 		total_len += 0x20;
 
-		unsigned char *t = hmac_compute(secret, secret_len, a, 0x20);
-		free(a);
-		a = t;
+		t = g_steal_pointer(&a);
+		a = hmac_compute(secret, secret_len, t, 0x20);
 	}
-	free(a);
 }
 
 static gboolean check_pad(unsigned char *data, int len)
@@ -813,7 +811,7 @@ static void reverse_mem(unsigned char* data, int size)
 static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *enc_data, int res_len)
 {
 	int tlen1 = 0, tlen2;
-	unsigned char *res = NULL;
+	g_autofree unsigned char *res = NULL;
 	gboolean ret;
 	EVP_CIPHER_CTX *context;
 
@@ -826,7 +824,7 @@ static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *en
 		goto out;
 	}
 
-	res = malloc(res_len);
+	res = g_malloc(res_len);
 	EVP_CIPHER_CTX_set_padding(context, 0);
 
 	if (!EVP_DecryptUpdate(context, res, &tlen1, enc_data + 0x10, res_len)) {
@@ -850,7 +848,6 @@ static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *en
 	ret = check_pad(res, res_len);
 out:
 	EVP_CIPHER_CTX_free(context);
-	free(res);
 
 	return ret;
 }
@@ -950,6 +947,14 @@ struct tls_handshake_t {
 	unsigned char *client_hello;
 };
 
+static void tls_handshake_free(struct tls_handshake_t *tlshd)
+{
+	HASH_Destroy(tlshd->tls_hash_context);
+	HASH_Destroy(tlshd->tls_hash_context2);
+	g_clear_pointer(&tlshd->client_hello, g_free);
+	g_free(tlshd);
+}
+
 static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 {
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
@@ -970,7 +975,7 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		HASH_Begin(tlshd->tls_hash_context);
 		HASH_Begin(tlshd->tls_hash_context2);
 
-		client_hello = malloc(G_N_ELEMENTS(TLS_CLIENT_HELLO));
+		client_hello = g_malloc(G_N_ELEMENTS(TLS_CLIENT_HELLO));
 		tlshd->client_hello = client_hello;
 
 		current_time = time(NULL);
@@ -993,7 +998,7 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 	{
 		unsigned char server_random[0x40];
 		unsigned char seed[0x40], expansion_seed[0x40];
-		unsigned char *pre_master_secret;
+		g_autofree unsigned char *pre_master_secret = NULL;
 		size_t pre_master_secret_len;
 
 		EC_KEY *priv_key, *pub_key;
@@ -1030,7 +1035,7 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 
 		EVP_PKEY_derive(ctx, NULL, &pre_master_secret_len);
 
-		pre_master_secret = malloc(pre_master_secret_len);
+		pre_master_secret = g_malloc(pre_master_secret_len);
 		if (!ECDH_compute_key(pre_master_secret, pre_master_secret_len, EC_KEY_get0_public_key(pub_key), priv_key, NULL)) {
 			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
 							 "Failed to compute key, "
@@ -1038,7 +1043,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 							 ERR_peek_last_error(),
 							 ERR_error_string(ERR_peek_last_error(), NULL));
 			fpi_ssm_mark_failed(ssm, error);
-			g_free(pre_master_secret);
 			break;
 		}
 
@@ -1053,7 +1057,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		TLS_PRF2(tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret), "key expansion",
 			seed, G_N_ELEMENTS(seed), vdev->key_block, G_N_ELEMENTS(vdev->key_block));
 
-		g_free(pre_master_secret);
 		EC_KEY_free(priv_key);
 		EC_KEY_free(pub_key);
 		EVP_PKEY_free(priv);
@@ -1068,7 +1071,8 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 	{
 		EC_KEY *ecdsa_key;
 		unsigned char test[0x20];
-		unsigned char *cert_verify_signature, *final;
+		g_autofree unsigned char *cert_verify_signature = NULL;
+		g_autofree unsigned char *final = NULL;
 		unsigned int test_len;
 		int len;
 
@@ -1100,9 +1104,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		memcpy(vinit->tls_certificate + 0x169, final, len);
 
 		EC_KEY_free(ecdsa_key);
-
-		g_free(cert_verify_signature);
-		g_free(final);
 
 		fpi_ssm_next_state(ssm);
 
@@ -1152,11 +1153,6 @@ static void handshake_ssm_cb(FpiSsm *ssm, FpDevice *dev, GError *error)
 	} else {
 		fpi_ssm_next_state(parent_ssm);
 	}
-
-	HASH_Destroy(tlshd->tls_hash_context);
-	HASH_Destroy(tlshd->tls_hash_context2);
-	g_clear_pointer(&tlshd->client_hello, g_free);
-	g_free(tlshd);
 }
 
 static void start_handshake_ssm(FpImageDevice *idev,
@@ -1172,7 +1168,7 @@ static void start_handshake_ssm(FpImageDevice *idev,
 
 	ssm = fpi_ssm_new(FP_DEVICE(idev), handshake_ssm,
 			  TLS_HANDSHAKE_STATE_LAST);
-	fpi_ssm_set_data(ssm, tlshd, NULL);
+	fpi_ssm_set_data(ssm, tlshd, (GDestroyNotify) tls_handshake_free);
 	fpi_ssm_start(ssm, handshake_ssm_cb);
 }
 
@@ -1375,16 +1371,12 @@ static void dev_open_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	/* Notify open complete */
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
-	struct vfs_init_t *vinit = fpi_ssm_get_data(ssm);
 
 	if (error)
 		fpi_image_device_session_error(idev, error);
 
 	if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 		fpi_image_device_open_complete(idev, error);
-
-	g_free(vinit->main_seed);
-	g_free(vinit);
 }
 
 /* Open device */
@@ -1435,7 +1427,7 @@ static void dev_open(FpImageDevice *idev)
 
 	/* Clearing previous device state */
 	ssm = fpi_ssm_new(dev, init_ssm, INIT_STATE_LAST);
-	fpi_ssm_set_data(ssm, g_new0(struct vfs_init_t, 1), NULL);
+	fpi_ssm_set_data(ssm, g_new0(struct vfs_init_t, 1), (GDestroyNotify) vfs_init_free);
 	fpi_ssm_start(ssm, dev_open_callback);
 }
 
@@ -1474,8 +1466,6 @@ static void finger_image_download_callback(FpiSsm *ssm, FpDevice *dev, GError *e
 
 		fpi_ssm_mark_failed(imgdown->parent_ssm, error);
 	}
-
-	g_free(imgdown);
 }
 
 static void finger_image_submit(FpImageDevice *idev,
@@ -1610,7 +1600,7 @@ static void start_finger_image_download_subsm(FpImageDevice *idev,
 			  finger_image_download_ssm,
 			  IMAGE_DOWNLOAD_STATE_LAST);
 
-	fpi_ssm_set_data(ssm, imgdown, NULL);
+	fpi_ssm_set_data(ssm, imgdown, g_free);
 	fpi_ssm_start(ssm, finger_image_download_callback);
 }
 
@@ -1634,8 +1624,6 @@ static void scan_error_handler_callback(FpiSsm *ssm, FpDevice *dev, GError *erro
 	} else {
 		fpi_ssm_mark_completed(error_data->parent_ssm);
 	}
-
-	g_free(error_data);
 }
 
 static void scan_error_handler_ssm(FpiSsm *ssm, FpDevice *dev)
@@ -1681,7 +1669,7 @@ static void start_scan_error_handler_ssm(FpImageDevice *idev,
 
 	ssm = fpi_ssm_new(FP_DEVICE(idev), scan_error_handler_ssm,
 			  SCAN_ERROR_STATE_LAST);
-	fpi_ssm_set_data(ssm, error_data, NULL);
+	fpi_ssm_set_data(ssm, error_data, g_free);
 	fpi_ssm_start(ssm, scan_error_handler_callback);
 }
 

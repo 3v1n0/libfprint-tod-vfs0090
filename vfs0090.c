@@ -67,6 +67,13 @@ struct _FpiDeviceVfs0090 {
 
 G_DEFINE_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FP_TYPE_IMAGE_DEVICE)
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(EVP_CIPHER_CTX, EVP_CIPHER_CTX_free);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(ECDSA_SIG, ECDSA_SIG_free);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(EC_KEY, EC_KEY_free);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(EVP_PKEY, EVP_PKEY_free);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(EVP_PKEY_CTX, EVP_PKEY_CTX_free);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(BIGNUM, BN_free);
+
 struct vfs_init_t {
 	unsigned char *main_seed;
 	unsigned int main_seed_length;
@@ -557,6 +564,7 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	g_autofree unsigned char *all_data = NULL;
 	g_autofree unsigned char *hmac = NULL;
 	g_autofree unsigned char *pad = NULL;
+	g_autoptr(EVP_CIPHER_CTX) context = NULL;
 	const unsigned char iv[] = {
 		0x4b, 0x77, 0x62, 0xff, 0xa9, 0x03, 0xc1, 0x1e,
 		0x6f, 0xd8, 0x35, 0x93, 0x17, 0x2d, 0x54, 0xef
@@ -574,7 +582,7 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	hmac = hmac_compute(key_block, 0x20, all_data, prefix_len + data_len);
 	memcpy(all_data + prefix_len + data_len, hmac, 0x20);
 
-	EVP_CIPHER_CTX *context = EVP_CIPHER_CTX_new();
+	context = EVP_CIPHER_CTX_new();
 	EVP_EncryptInit(context, EVP_aes_256_cbc(), key_block + 0x40, iv);
 	EVP_CIPHER_CTX_set_padding(context, 0);
 
@@ -596,8 +604,6 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 
 	EVP_EncryptFinal(context, *res + 0x10 + written + wr3, &wr2);
 	*res_len = written + wr2 + wr3 + 0x10;
-
-	EVP_CIPHER_CTX_free(context);
 }
 
 static unsigned char *tls_encrypt(FpImageDevice *idev,
@@ -627,11 +633,11 @@ static gboolean tls_decrypt(FpImageDevice *idev,
 			    unsigned char *output_buffer, int *output_len)
 {
 	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	g_autoptr(EVP_CIPHER_CTX) context = NULL;
 
 	int buff_len = buffer_size - 5;
 	int out_len = buff_len - 0x10;
 	int tlen1 = 0, tlen2;
-	gboolean ret = FALSE;
 
 	g_return_val_if_fail(buffer != NULL, FALSE);
 	g_return_val_if_fail(buffer_size > 0, FALSE);
@@ -640,11 +646,11 @@ static gboolean tls_decrypt(FpImageDevice *idev,
 	buffer += 5;
 	*output_len = 0;
 
-	EVP_CIPHER_CTX *context = EVP_CIPHER_CTX_new();
+	context = EVP_CIPHER_CTX_new();
 	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vdev->key_block + 0x60, buffer)) {
 		fp_err("Decryption failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+		return FALSE;
 	}
 
 	EVP_CIPHER_CTX_set_padding(context, 0);
@@ -652,22 +658,18 @@ static gboolean tls_decrypt(FpImageDevice *idev,
 	if (!EVP_DecryptUpdate(context, output_buffer, &tlen1, buffer + 0x10, out_len)) {
 		fp_err("Decryption failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+		return FALSE;
 	}
 
 	if (!EVP_DecryptFinal(context, output_buffer + tlen1, &tlen2)) {
 		fp_err("Decryption failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+		return FALSE;
 	}
 
 	*output_len = tlen1 + tlen2 - 0x20 - (output_buffer[out_len - 1] + 1);
-	ret = TRUE;
 
-	out:
-	EVP_CIPHER_CTX_free(context);
-
-	return ret;
+	return TRUE;
 }
 
 static gboolean check_data_exchange(FpiDeviceVfs0090 *vdev, const struct data_exchange_t *dex)
@@ -812,16 +814,14 @@ static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *en
 {
 	int tlen1 = 0, tlen2;
 	g_autofree unsigned char *res = NULL;
-	gboolean ret;
-	EVP_CIPHER_CTX *context;
+	g_autoptr(EVP_CIPHER_CTX) context = NULL;
 
-	ret = FALSE;
 	context = EVP_CIPHER_CTX_new();
 
 	if (!EVP_DecryptInit(context, EVP_aes_256_cbc(), vinit->masterkey_aes, enc_data)) {
 		fp_err("Failed to initialize EVP decrypt, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+		return FALSE;
 	}
 
 	res = g_malloc(res_len);
@@ -830,13 +830,13 @@ static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *en
 	if (!EVP_DecryptUpdate(context, res, &tlen1, enc_data + 0x10, res_len)) {
 		fp_err("Failed to EVP decrypt, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+		return FALSE;
 	}
 
 	if (!EVP_DecryptFinal(context, res + tlen1, &tlen2)) {
 		fp_err("EVP Final decrypt failed, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto out;
+		return FALSE;
 	}
 
 	reverse_mem(res, 0x20);
@@ -845,11 +845,7 @@ static gboolean initialize_ecdsa_key(struct vfs_init_t *vinit, unsigned char *en
 
 	memcpy(vinit->ecdsa_private_key, res, VFS_ECDSA_PRIVATE_KEY_SIZE);
 
-	ret = check_pad(res, res_len);
-out:
-	EVP_CIPHER_CTX_free(context);
-
-	return ret;
+	return check_pad(res, res_len);
 }
 
 static gboolean make_ecdsa_key(struct vfs_init_t *vinit, unsigned char *data)
@@ -870,15 +866,19 @@ static gboolean make_ecdsa_key(struct vfs_init_t *vinit, unsigned char *data)
 
 static EC_KEY *load_key(const unsigned char *data, gboolean is_private)
 {
-	BIGNUM *x = BN_bin2bn(data, 0x20, NULL);
-	BIGNUM *y = BN_bin2bn(data + 0x20, 0x20, NULL);
-	BIGNUM *d = NULL;
-	EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+	g_autoptr(BIGNUM) x = NULL;
+	g_autoptr(BIGNUM) y = NULL;
+	g_autoptr(BIGNUM) d = NULL;
+	g_autoptr(EC_KEY) key = NULL;
+
+	x = BN_bin2bn(data, 0x20, NULL);
+	y = BN_bin2bn(data + 0x20, 0x20, NULL);
+	key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
 
 	if (!EC_KEY_set_public_key_affine_coordinates(key, x,y)) {
 		fp_err("Failed to set public key coordinates, error: %lu, %s",
 		       ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto err;
+		return NULL;
 	}
 
 	if (is_private) {
@@ -886,27 +886,17 @@ static EC_KEY *load_key(const unsigned char *data, gboolean is_private)
 		if (!EC_KEY_set_private_key(key, d)) {
 			fp_err("Failed to set private key, error: %lu, %s",
 				ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-			goto err;
+			return NULL;
 		}
 	}
 
 	if (!EC_KEY_check_key(key)) {
 		fp_err("Failed to check key, error: %lu, %s",
 			ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-		goto err;
+		return NULL;
 	}
 
-	goto out;
-
-err:
-	g_clear_pointer(&key, EC_KEY_free);
-
-out:
-	g_clear_pointer(&x, BN_free);
-	g_clear_pointer(&y, BN_free);
-	g_clear_pointer(&d, BN_free);
-
-	return key;
+	return g_steal_pointer(&key);
 }
 
 static void fill_buffer_with_random(unsigned char *buffer, int size)
@@ -923,14 +913,15 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 	unsigned char *res = NULL;
 
 	do {
-		ECDSA_SIG *sig = ECDSA_do_sign(data, data_len, key);
+		g_autoptr(ECDSA_SIG) sig = NULL;
+
+		sig = ECDSA_do_sign(data, data_len, key);
 		len = i2d_ECDSA_SIG(sig, NULL);
 
 		free(res);
-		res = malloc(len);
+		res = g_malloc(len);
 		unsigned char *f = res;
 		i2d_ECDSA_SIG(sig, &f);
-		ECDSA_SIG_free(sig);
 	} while (len != VFS_ECDSA_SIGNATURE_SIZE);
 
 	return res;
@@ -998,12 +989,13 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 	{
 		unsigned char server_random[0x40];
 		unsigned char seed[0x40], expansion_seed[0x40];
-		g_autofree unsigned char *pre_master_secret = NULL;
 		size_t pre_master_secret_len;
-
-		EC_KEY *priv_key, *pub_key;
-		EVP_PKEY_CTX *ctx;
-		EVP_PKEY *priv, *pub;
+		g_autofree unsigned char *pre_master_secret = NULL;
+		g_autoptr(EC_KEY) priv_key = NULL;
+		g_autoptr(EC_KEY) pub_key = NULL;
+		g_autoptr(EVP_PKEY_CTX) ctx = NULL;
+		g_autoptr(EVP_PKEY) priv = NULL;
+		g_autoptr(EVP_PKEY) pub = NULL;
 
 		memcpy(server_random, tlshd->read_buffer + 0xb, G_N_ELEMENTS(server_random));
 		HASH_Update(tlshd->tls_hash_context, tlshd->read_buffer + 0x05, 0x3d);
@@ -1057,19 +1049,13 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		TLS_PRF2(tlshd->master_secret, G_N_ELEMENTS(tlshd->master_secret), "key expansion",
 			seed, G_N_ELEMENTS(seed), vdev->key_block, G_N_ELEMENTS(vdev->key_block));
 
-		EC_KEY_free(priv_key);
-		EC_KEY_free(pub_key);
-		EVP_PKEY_free(priv);
-		EVP_PKEY_free(pub);
-		EVP_PKEY_CTX_free(ctx);
-
 		fpi_ssm_next_state(ssm);
 
 		break;
 	}
 	case TLS_HANDSHAKE_GENERATE_CERT:
 	{
-		EC_KEY *ecdsa_key;
+		g_autoptr(EC_KEY) ecdsa_key = NULL;
 		unsigned char test[0x20];
 		g_autofree unsigned char *cert_verify_signature = NULL;
 		g_autofree unsigned char *final = NULL;
@@ -1102,8 +1088,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 
 		mac_then_encrypt(0x16, vdev->key_block, finished_message, 0x10, &final, &len);
 		memcpy(vinit->tls_certificate + 0x169, final, len);
-
-		EC_KEY_free(ecdsa_key);
 
 		fpi_ssm_next_state(ssm);
 

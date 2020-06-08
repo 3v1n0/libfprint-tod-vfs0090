@@ -124,10 +124,10 @@ static void print_hex(unsigned char *data, int len) {
 	print_hex_gn(data, len, 1);
 }
 
-/* remove emmmeeme */
 static void start_reactivate_subsm(FpDevice *dev,
 				   FpiSsm *parent_ssm);
 
+/* remove emmmeeme */
 static unsigned char *tls_encrypt(FpImageDevice *idev,
 				  const unsigned char *data, int data_size,
 				  int *encrypted_len_out);
@@ -150,8 +150,7 @@ static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
 
 	if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 		fp_dbg("USB write transfer cancelled");
-		g_free(op_data);
-		return;
+		goto out;
 	}
 
 	vdev = FPI_DEVICE_VFS0090(device);
@@ -198,11 +197,7 @@ static void async_write_to_usb(FpImageDevice *idev,
 	transfer = fpi_usb_transfer_new(FP_DEVICE(idev));
 	fpi_usb_transfer_fill_bulk_full(transfer, EP_OUT,
 					(guint8 *) data, data_size, NULL);
-	// fpi_usb_transfer_fill_bulk_full(transfer, EP_OUT,
-					// (unsigned char *)data, data_size, NULL);
-	// fpi_usb_transfer_submit(transfer, VFS_USB_TIMEOUT, NULL,
-				// async_write_callback, op_data);
-	// fpi_usb_transfer_unref(transfer);
+
 	g_set_object(&vdev->cancellable, g_cancellable_new ());
 	fpi_usb_transfer_submit(transfer, VFS_USB_TIMEOUT,
 				vdev->cancellable,
@@ -217,8 +212,7 @@ static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
 
 	if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 		fp_dbg("USB read transfer cancelled");
-		g_free(op_data);
-		return;
+		goto out;
 	}
 
 	vdev = FPI_DEVICE_VFS0090(device);
@@ -1009,7 +1003,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		if (!(priv_key = load_key(PRIVKEY, TRUE))) {
 			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
 							 "Impossible to load private key");
-			fp_err("%s", error->message);
 			fpi_ssm_mark_failed(ssm, error);
 			break;
 		}
@@ -1017,7 +1010,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		if (!(pub_key = load_key(vinit->pubkey, FALSE))) {
 			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
 							 "Impossible to load private key");
-			fp_err("%s", error->message);
 			fpi_ssm_mark_failed(ssm, error);
 			break;
 		}
@@ -1041,7 +1033,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 							 "error: %lu, %s",
 							 ERR_peek_last_error(),
 							 ERR_error_string(ERR_peek_last_error(), NULL));
-			fp_err("%s", error->message);
 			fpi_ssm_mark_failed(ssm, error);
 			g_free(pre_master_secret);
 			break;
@@ -1132,7 +1123,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		           MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
 			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
 							 "TLS Certificate submitted isn't accepted by reader");
-			fp_err("%s", error->message);
 			fpi_ssm_mark_failed(ssm, error);
 			break;
 		}
@@ -1144,7 +1134,6 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -1290,7 +1279,6 @@ static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 						"instance running Windows, or with a native " \
 						"Windows installation first.",
 						vdev->buffer[vdev->buffer_length-1]);
-				fp_err("%s", error->message);
 				fpi_ssm_mark_failed(ssm, error);
 				break;
 			}
@@ -1334,7 +1322,6 @@ static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 					"Initialization failed at state %d, "
 					"ECDSA key generation",
 					fpi_ssm_get_cur_state(ssm));
-			fp_err("%s", error->message);
 			fpi_ssm_mark_failed(ssm, error);
 		}
 		break;
@@ -1367,7 +1354,6 @@ static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown init state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -1377,11 +1363,7 @@ static void dev_open_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	/* Notify open complete */
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	struct vfs_init_t *vinit = fpi_ssm_get_data(ssm);
-
-	g_clear_pointer(&vdev->buffer, g_free);
-	vdev->buffer_length = 0;
 
 	if (fpi_ssm_get_error(ssm))
 		fpi_image_device_session_error(idev, error);
@@ -1487,12 +1469,13 @@ static void finger_image_submit(FpImageDevice *idev,
 	memcpy(img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 
 	if (VFS_IMAGE_RESCALE > 1) {
-		FpImage *resized;
+		g_autoptr(FpImage) resized = NULL;
 
 		resized = fpi_image_resize(img, VFS_IMAGE_RESCALE, VFS_IMAGE_RESCALE);
 		g_set_object(&img, resized);
 	}
 
+	fp_dbg("Submitting captured image");
 	fpi_image_device_image_captured(idev, img);
 }
 
@@ -1600,7 +1583,6 @@ static void finger_image_download_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown image download state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -1671,7 +1653,6 @@ static void scan_error_handler_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown scan state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -1696,7 +1677,6 @@ static void start_scan_error_handler_ssm(FpImageDevice *idev,
 static void finger_scan_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	if (fpi_ssm_get_error(ssm)) {
 		fp_err("Scan failed failed at state %d, unexpected "
@@ -1709,9 +1689,6 @@ static void finger_scan_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 			fpi_image_device_session_error(idev, error);
 		}
 	}
-
-	vdev->buffer_length = 0;
-	g_clear_pointer(&vdev->buffer, g_free);
 }
 
 static void finger_scan_interrupt_callback(FpImageDevice *idev, gpointer data, GError *error)
@@ -1771,18 +1748,13 @@ static void finger_scan_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown scan state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
 static void start_finger_scan(FpImageDevice *idev)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 	FpiSsm *ssm;
-
-	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
-	vdev->buffer_length = 0;
 
 	ssm = fpi_ssm_new(FP_DEVICE(idev), finger_scan_ssm, SCAN_STATE_LAST);
 	fpi_ssm_start(ssm, finger_scan_callback);
@@ -1820,7 +1792,6 @@ static void activate_device_interrupt_callback(FpImageDevice *idev, gpointer dat
 							 "Unexpected device interrupt "
 							 "(%d) at this state",
 							 interrupt_type);
-			fp_err("%s", error->message);
 			print_hex(vdev->buffer, vdev->buffer_length);
 			fpi_ssm_mark_failed(ssm, error);
 		}
@@ -1868,7 +1839,6 @@ static void activate_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown activation state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -1877,16 +1847,12 @@ static void activate_ssm(FpiSsm *ssm, FpDevice *dev)
 static void dev_activate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	if (fpi_ssm_get_error(ssm)) {
 		fp_err("Activation failed failed at state %d, unexpected "
 		       "device reply during activation", fpi_ssm_get_cur_state(ssm));
 		fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
 	}
-
-	g_clear_pointer(&vdev->buffer, g_free);
-	vdev->buffer_length = 0;
 
 	fpi_image_device_activate_complete(idev, fpi_ssm_get_error(ssm));
 
@@ -1896,12 +1862,7 @@ static void dev_activate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 
 static void dev_activate(FpImageDevice *idev)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 	FpiSsm *ssm;
-
-	// SEE IF CAN BE DONE ONLY ON CERTAIN CASES
-	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
-	vdev->buffer_length = 0;
 
 	ssm = fpi_ssm_new(FP_DEVICE(idev), activate_ssm, ACTIVATE_STATE_LAST);
 	fpi_ssm_start(ssm, dev_activate_callback);
@@ -1942,7 +1903,6 @@ static void deactivate_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown deactivate state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 }
@@ -1958,9 +1918,6 @@ static void dev_deactivate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 		fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
 	}
 
-	g_clear_pointer(&vdev->buffer, g_free);
-	vdev->buffer_length = 0;
-
 	g_cancellable_cancel(vdev->cancellable);
 	g_clear_object(&vdev->cancellable);
 
@@ -1969,13 +1926,7 @@ static void dev_deactivate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 
 static void dev_deactivate(FpImageDevice *idev)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 	FpiSsm *ssm;
-
-	g_clear_pointer(&vdev->buffer, g_free);
-
-	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
-	vdev->buffer_length = 0;
 
 	ssm = fpi_ssm_new(FP_DEVICE(idev), deactivate_ssm,
 			  DEACTIVATE_STATE_LAST);
@@ -2002,7 +1953,6 @@ static void reactivate_ssm(FpiSsm *ssm, FpDevice *dev)
 	default:
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "Unknown reactivate state");
-		fp_err("%s", error->message);
 		fpi_ssm_mark_failed(ssm, error);
 	}
 

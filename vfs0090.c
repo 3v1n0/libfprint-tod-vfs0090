@@ -18,11 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "fp-device.h"
 #include "fpi-device.h"
-#include "fpi-image-device.h"
-#include "fpi-ssm.h"
-#include "fpi-usb-transfer.h"
 #define FP_COMPONENT "vfs0090"
 
 // #include "fpi-device.h"
@@ -142,17 +138,15 @@ static void print_hex(unsigned char *data, int len) {
 static void start_reactivate_ssm(FpDevice *dev);
 
 /* remove emmmeeme */
-static unsigned char *tls_encrypt(FpImageDevice *idev,
+static unsigned char *tls_encrypt(FpDevice *dev,
 				  const unsigned char *data, int data_size,
 				  int *encrypted_len_out);
-static gboolean tls_decrypt(FpImageDevice *idev,
+static gboolean tls_decrypt(FpDevice *dev,
 			    const unsigned char *buffer, int buffer_size,
 			    unsigned char *output_buffer, int *output_len);
 
-typedef void (*async_operation_cb)(FpImageDevice *idev, gpointer data, GError *error);
-
 struct async_usb_operation_data_t {
-	async_operation_cb callback;
+	FpiUsbTransferCallback callback;
 	void *callback_data;
 };
 
@@ -185,17 +179,17 @@ static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
 
 out:
 	if (op_data && op_data->callback)
-		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
+		op_data->callback(transfer, device, op_data->callback_data, error);
 	else if (error)
 		fpi_image_device_session_error(FP_IMAGE_DEVICE(device), error);
 }
 
-static void async_write_to_usb(FpImageDevice *idev,
+static void async_write_to_usb(FpDevice *dev,
 			       const unsigned char *data, int data_size,
-			       async_operation_cb callback, void* callback_data)
+			       FpiUsbTransferCallback callback, gpointer callback_data)
 {
 	struct async_usb_operation_data_t *op_data;
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	FpiUsbTransfer *transfer;
 
 	g_assert_true(!vdev->cancellable ||
@@ -205,7 +199,7 @@ static void async_write_to_usb(FpImageDevice *idev,
 	op_data->callback = callback;
 	op_data->callback_data = callback_data;
 
-	transfer = fpi_usb_transfer_new(FP_DEVICE(idev));
+	transfer = fpi_usb_transfer_new(dev);
 	fpi_usb_transfer_fill_bulk_full(transfer, EP_OUT,
 					(guint8 *) data, data_size, NULL);
 
@@ -240,24 +234,24 @@ static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
 
 out:
 	if (op_data && op_data->callback)
-		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
+		op_data->callback(transfer, device, op_data->callback_data, error);
 	else if (error)
 		fpi_image_device_session_error(FP_IMAGE_DEVICE(device), error);
 }
 
-static void async_read_from_usb(FpImageDevice *idev, FpiTransferType transfer_type,
+static void async_read_from_usb(FpDevice *dev, FpiTransferType transfer_type,
 				unsigned char *buffer, int buffer_size,
-				async_operation_cb callback, void* callback_data)
+				FpiUsbTransferCallback callback, gpointer callback_data)
 {
 	struct async_usb_operation_data_t *op_data;
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	FpiUsbTransfer *transfer;
 	guint timeout = VFS_USB_TIMEOUT;
 
 	g_assert_true(!vdev->cancellable ||
 	              g_cancellable_is_cancelled(vdev->cancellable));
 
-	transfer = fpi_usb_transfer_new(FP_DEVICE(idev));
+	transfer = fpi_usb_transfer_new(dev);
 	g_set_object(&vdev->cancellable, g_cancellable_new());
 
 	op_data = g_new0(struct async_usb_operation_data_t, 1);
@@ -285,34 +279,37 @@ static void async_read_from_usb(FpImageDevice *idev, FpiTransferType transfer_ty
 }
 
 struct async_usb_encrypted_operation_data_t {
-	async_operation_cb callback;
+	FpiUsbTransferCallback callback;
 	void *callback_data;
 
 	unsigned char *encrypted_data;
 	int encrypted_data_size;
 };
 
-static void async_write_encrypted_callback(FpImageDevice *idev, gpointer data, GError *error)
+static void async_write_encrypted_callback(FpiUsbTransfer *transfer, FpDevice *dev,
+					   gpointer data, GError *error)
 {
 	g_autofree struct async_usb_encrypted_operation_data_t *enc_op = data;
 
 	if (enc_op->callback)
-		enc_op->callback(idev, enc_op->callback_data, error);
+		enc_op->callback(transfer, dev, enc_op->callback_data, error);
+	else if (error)
+		fpi_device_action_error(dev, error);
 
 	g_clear_pointer(&enc_op->encrypted_data, g_free);
 }
 
-static void async_write_encrypted_to_usb(FpImageDevice *idev,
+static void async_write_encrypted_to_usb(FpDevice *dev,
 					 const unsigned char *data,
 					 int data_size,
-					 async_operation_cb callback,
-					 void* callback_data)
+					 FpiUsbTransferCallback callback,
+					 gpointer callback_data)
 {
 	struct async_usb_encrypted_operation_data_t *enc_op;
 	unsigned char *encrypted_data;
 	int encrypted_data_size;
 
-	encrypted_data = tls_encrypt(idev, data, data_size,
+	encrypted_data = tls_encrypt(dev, data, data_size,
 				     &encrypted_data_size);
 
 	enc_op = g_new0(struct async_usb_encrypted_operation_data_t, 1);
@@ -321,21 +318,22 @@ static void async_write_encrypted_to_usb(FpImageDevice *idev,
 	enc_op->encrypted_data = encrypted_data;
 	enc_op->encrypted_data_size = encrypted_data_size;
 
-	async_write_to_usb(idev, encrypted_data, encrypted_data_size,
+	async_write_to_usb(dev, encrypted_data, encrypted_data_size,
 			   async_write_encrypted_callback, enc_op);
 }
 
-static void async_read_encrypted_callback(FpImageDevice *idev, gpointer data, GError *error)
+static void async_read_encrypted_callback(FpiUsbTransfer *transfer, FpDevice *dev,
+					  gpointer data, GError *error)
 {
 	g_autofree struct async_usb_encrypted_operation_data_t *enc_op = data;
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 
 	enc_op->encrypted_data = g_memdup(vdev->buffer, vdev->buffer_length);
 	enc_op->encrypted_data_size = vdev->buffer_length;
 
 	if (!error &&
 	    enc_op->encrypted_data && enc_op->encrypted_data_size &&
-	    !tls_decrypt(idev, enc_op->encrypted_data,
+	    !tls_decrypt(dev, enc_op->encrypted_data,
 			 enc_op->encrypted_data_size,
 			 vdev->buffer, &vdev->buffer_length)) {
 		error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
@@ -344,14 +342,16 @@ static void async_read_encrypted_callback(FpImageDevice *idev, gpointer data, GE
 	}
 
 	if (enc_op->callback)
-		enc_op->callback(idev, enc_op->callback_data, error);
+		enc_op->callback(transfer, dev, enc_op->callback_data, error);
+	else if (error)
+		fpi_device_action_error(dev, error);
 
 	g_clear_pointer(&enc_op->encrypted_data, g_free);
 }
 
-static void async_read_decrypt_from_usb(FpImageDevice *idev, FpiTransferType transfer_type,
+static void async_read_decrypt_from_usb(FpDevice *dev, FpiTransferType transfer_type,
 					unsigned char *buffer, int buffer_size,
-					async_operation_cb callback, void* callback_data)
+					FpiUsbTransferCallback callback, gpointer callback_data)
 {
 	struct async_usb_encrypted_operation_data_t *enc_op;
 
@@ -359,20 +359,21 @@ static void async_read_decrypt_from_usb(FpImageDevice *idev, FpiTransferType tra
 	enc_op->callback = callback;
 	enc_op->callback_data = callback_data;
 
-	async_read_from_usb(idev, transfer_type, buffer, buffer_size,
+	async_read_from_usb(dev, transfer_type, buffer, buffer_size,
 			    async_read_encrypted_callback, enc_op);
 }
 
 struct async_data_exchange_t {
-	async_operation_cb callback;
-	void* callback_data;
+	FpiUsbTransferCallback callback;
+	gpointer callback_data;
 
 	int exchange_mode;
 	unsigned char *buffer;
 	int buffer_size;
 };
 
-static void on_async_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *error)
+static void on_async_data_exchange_cb(FpiUsbTransfer *transfer, FpDevice *dev,
+				      gpointer data, GError *error)
 {
 	g_autofree struct async_data_exchange_t *dex = data;
 
@@ -380,26 +381,26 @@ static void on_async_data_exchange_cb(FpImageDevice *idev, gpointer data, GError
 
 	if (!error) {
 		if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
-			async_read_from_usb(idev, FP_TRANSFER_BULK,
+			async_read_from_usb(dev, FP_TRANSFER_BULK,
 					    dex->buffer,
 					    dex->buffer_size,
 					    dex->callback, dex->callback_data);
 		} else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED) {
-			async_read_decrypt_from_usb(idev, FP_TRANSFER_BULK,
+			async_read_decrypt_from_usb(dev, FP_TRANSFER_BULK,
 						    dex->buffer,
 						    dex->buffer_size,
 						    dex->callback,
 						    dex->callback_data);
 		}
 	} else if (dex->callback) {
-		dex->callback(idev, dex->callback_data, error);
+		dex->callback(transfer, dev, dex->callback_data, error);
 	}
 }
 
-static void async_data_exchange(FpImageDevice *idev, int exchange_mode,
+static void async_data_exchange(FpDevice *dev, int exchange_mode,
 				const unsigned char *data, int data_size,
 				unsigned char *buffer, int buffer_size,
-				async_operation_cb callback, void* callback_data)
+				FpiUsbTransferCallback callback, gpointer callback_data)
 {
 	struct async_data_exchange_t *dex;
 
@@ -411,10 +412,10 @@ static void async_data_exchange(FpImageDevice *idev, int exchange_mode,
 	dex->exchange_mode = exchange_mode;
 
 	if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
-		async_write_to_usb(idev, data, data_size,
+		async_write_to_usb(dev, data, data_size,
 				   on_async_data_exchange_cb, dex);
 	} else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED) {
-		async_write_encrypted_to_usb(idev, data, data_size,
+		async_write_encrypted_to_usb(dev, data, data_size,
 					     on_async_data_exchange_cb, dex);
 	} else {
 		GError *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
@@ -422,24 +423,20 @@ static void async_data_exchange(FpImageDevice *idev, int exchange_mode,
 		fp_err("%s", error->message);
 
 		if (callback)
-			callback(idev, callback_data, error);
+			callback(NULL, dev, callback_data, error);
 		else
-			fpi_image_device_session_error(idev, error);
+			fpi_device_action_error(dev, error);
 	}
 }
 
-static void async_transfer_callback_with_ssm(FpImageDevice *idev, gpointer data, GError *error)
+static void async_transfer_callback_with_ssm(FpiUsbTransfer *transfer, FpDevice *dev,
+					     gpointer data, GError *error)
 {
-	FpiSsm *ssm = data;
-
-	if (!error) {
-		fpi_ssm_next_state(ssm);
-	} else {
-		fpi_ssm_mark_failed(ssm, error);
-	}
+	transfer->ssm = data;
+	fpi_ssm_usb_transfer_cb (transfer, dev, data, error);
 }
 
-static void generate_main_seed(FpImageDevice *idev, struct vfs_init_t *vinit) {
+static void generate_main_seed(FpDevice *dev, struct vfs_init_t *vinit) {
 	char name[NAME_MAX], serial[NAME_MAX];
 	FILE *name_file, *serial_file;
 	int name_len, serial_len;
@@ -450,7 +447,7 @@ static void generate_main_seed(FpImageDevice *idev, struct vfs_init_t *vinit) {
 						 "Can't open "
 						 DMI_PRODUCT_NAME_NODE);
 		fp_err("%s", error->message);
-		fpi_device_action_error(FP_DEVICE(idev), error);
+		fpi_device_action_error(dev, error);
 		return;
 	}
 	if (!(serial_file = fopen(DMI_PRODUCT_SERIAL_NODE, "r"))) {
@@ -458,7 +455,7 @@ static void generate_main_seed(FpImageDevice *idev, struct vfs_init_t *vinit) {
 						 "Can't open "
 						 DMI_PRODUCT_SERIAL_NODE);
 		fp_err("%s", error->message);
-		fpi_device_action_error(FP_DEVICE(idev), error);
+		fpi_device_action_error(dev, error);
 		goto out_serial;
 	}
 
@@ -467,7 +464,7 @@ static void generate_main_seed(FpImageDevice *idev, struct vfs_init_t *vinit) {
 						 "Can't parse product name from "
 						 DMI_PRODUCT_NAME_NODE);
 		fp_err("%s", error->message);
-		fpi_device_action_error(FP_DEVICE(idev), error);
+		fpi_device_action_error(dev, error);
 		goto out_closeall;
 	}
 
@@ -476,7 +473,7 @@ static void generate_main_seed(FpImageDevice *idev, struct vfs_init_t *vinit) {
 						 "Can't parse product name from "
 						 DMI_PRODUCT_SERIAL_NODE);
 		fp_err("%s", error->message);
-		fpi_device_action_error(FP_DEVICE(idev), error);
+		fpi_device_action_error(dev, error);
 		goto out_closeall;
 	}
 
@@ -606,15 +603,14 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	*res_len = written + wr2 + wr3 + 0x10;
 }
 
-static unsigned char *tls_encrypt(FpImageDevice *idev,
+static unsigned char *tls_encrypt(FpDevice *dev,
 				  const unsigned char *data, int data_size,
 				  int *encrypted_len_out) {
-	FpiDeviceVfs0090 *vdev;
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	g_autofree unsigned char *res = NULL;
 	unsigned char *wr;
 	int res_len;
 
-	vdev = FPI_DEVICE_VFS0090(idev);
 	g_assert(vdev->key_block);
 
 	mac_then_encrypt(0x17, vdev->key_block, data, data_size, &res, &res_len);
@@ -628,11 +624,11 @@ static unsigned char *tls_encrypt(FpImageDevice *idev,
 	return wr;
 }
 
-static gboolean tls_decrypt(FpImageDevice *idev,
+static gboolean tls_decrypt(FpDevice *dev,
 			    const unsigned char *buffer, int buffer_size,
 			    unsigned char *output_buffer, int *output_len)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	g_autoptr(EVP_CIPHER_CTX) context = NULL;
 
 	int buff_len = buffer_size - 5;
@@ -716,10 +712,11 @@ struct data_exchange_async_data_t {
 	const struct data_exchange_t *dex;
 };
 
-static void on_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *error)
+static void on_data_exchange_cb(FpiUsbTransfer *transfer, FpDevice *dev,
+			        gpointer data, GError *error)
 {
 	g_autofree struct data_exchange_async_data_t *dex_data = data;
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 
 	if (!error) {
 		if (check_data_exchange_dbg(vdev, dex_data->dex)) {
@@ -739,17 +736,16 @@ static void on_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *erro
 	}
 }
 
-static void do_data_exchange(FpImageDevice *idev, FpiSsm *ssm,
+static void do_data_exchange(FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 			     const struct data_exchange_t *dex, int mode)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 	struct data_exchange_async_data_t *dex_data;
 
 	dex_data = g_new0(struct data_exchange_async_data_t, 1);
 	dex_data->ssm = ssm;
 	dex_data->dex = dex;
 
-	async_data_exchange(idev, mode, dex->msg, dex->msg_length,
+	async_data_exchange(FP_DEVICE(vdev), mode, dex->msg, dex->msg_length,
 			    vdev->buffer, VFS_USB_BUFFER_SIZE,
 			    on_data_exchange_cb, dex_data);
 }
@@ -977,7 +973,7 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 		HASH_Update(tlshd->tls_hash_context, client_hello + 0x09, 0x43);
 		HASH_Update(tlshd->tls_hash_context2, client_hello + 0x09, 0x43);
 
-		async_data_exchange(idev, DATA_EXCHANGE_PLAIN,
+		async_data_exchange(dev, DATA_EXCHANGE_PLAIN,
 				    client_hello, G_N_ELEMENTS(TLS_CLIENT_HELLO),
 				    tlshd->read_buffer, sizeof(tlshd->read_buffer),
 				    async_transfer_callback_with_ssm, ssm);
@@ -1094,7 +1090,7 @@ static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 	}
 	case TLS_HANDSHAKE_STATE_SEND_CERT:
 	{
-		async_data_exchange(idev, DATA_EXCHANGE_PLAIN,
+		async_data_exchange(dev, DATA_EXCHANGE_PLAIN,
 				    vinit->tls_certificate,
 				    sizeof(vinit->tls_certificate),
 				    tlshd->read_buffer, VFS_USB_BUFFER_SIZE,
@@ -1216,10 +1212,10 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 	return VFS_SCAN_UNKNOWN;
 }
 
-static void send_init_sequence(FpImageDevice *idev, FpiSsm *ssm,
+static void send_init_sequence(FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 			       int sequence)
 {
-	do_data_exchange(idev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
+	do_data_exchange(vdev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
 }
 
 /* Main SSM loop */
@@ -1232,7 +1228,7 @@ static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case INIT_STATE_GENERATE_MAIN_SEED:
-		generate_main_seed(idev, vinit);
+		generate_main_seed(dev, vinit);
 		fpi_ssm_next_state(ssm);
 		break;
 
@@ -1263,7 +1259,7 @@ static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 	case INIT_STATE_SEQ_4:
 	case INIT_STATE_SEQ_5:
 	case INIT_STATE_SEQ_6:
-		send_init_sequence(idev, ssm, fpi_ssm_get_cur_state(ssm) - INIT_STATE_SEQ_1);
+		send_init_sequence(vdev, ssm, fpi_ssm_get_cur_state(ssm) - INIT_STATE_SEQ_1);
 		break;
 
 	case INIT_STATE_MASTER_KEY:
@@ -1401,7 +1397,8 @@ static void dev_open(FpImageDevice *idev)
 	fpi_ssm_start(ssm, dev_open_callback);
 }
 
-static void led_blink_callback_with_ssm(FpImageDevice *idev, gpointer data, GError *error)
+static void led_blink_callback_with_ssm(FpiUsbTransfer *transfer, FpDevice *dev,
+					gpointer data, GError *error)
 {
 	FpiSsm *ssm = data;
 
@@ -1458,9 +1455,10 @@ static void finger_image_submit(FpImageDevice *idev,
 	fpi_image_device_image_captured(idev, img);
 }
 
-static void finger_image_download_read_callback(FpImageDevice *idev, gpointer data, GError *error)
+static void finger_image_download_read_callback(FpiUsbTransfer *transfer, FpDevice *dev,
+						gpointer data, GError *error)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	FpiSsm *ssm = data;
 	struct image_download_t *imgdown = fpi_ssm_get_data(ssm);
 	int offset = (fpi_ssm_get_cur_state(ssm) == IMAGE_DOWNLOAD_STATE_1) ? 0x12 : 0x06;
@@ -1493,7 +1491,7 @@ static void finger_image_download_ssm(FpiSsm *ssm, FpDevice *dev)
 	case IMAGE_DOWNLOAD_STATE_1:
 	case IMAGE_DOWNLOAD_STATE_2:
 	case IMAGE_DOWNLOAD_STATE_3:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+		async_data_exchange(dev, DATA_EXCHANGE_ENCRYPTED,
 				    read_buffer_request,
 				    sizeof(read_buffer_request),
 				    vdev->buffer,
@@ -1524,7 +1522,7 @@ static void finger_image_download_ssm(FpiSsm *ssm, FpDevice *dev)
 		break;
 
 	case IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+		async_data_exchange(dev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_GREEN_BLINK, G_N_ELEMENTS(LED_GREEN_BLINK),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    led_blink_callback_with_ssm, ssm);
@@ -1533,7 +1531,7 @@ static void finger_image_download_ssm(FpiSsm *ssm, FpDevice *dev)
 
 
 	case IMAGE_DOWNLOAD_STATE_RED_LED_BLINK:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+		async_data_exchange(dev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    led_blink_callback_with_ssm, ssm);
@@ -1605,7 +1603,7 @@ static void scan_error_handler_ssm(FpiSsm *ssm, FpDevice *dev)
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case SCAN_ERROR_STATE_LED_BLINK:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+		async_data_exchange(dev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_RED_BLINK, G_N_ELEMENTS(LED_RED_BLINK),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    led_blink_callback_with_ssm, ssm);
@@ -1657,9 +1655,10 @@ static void finger_scan_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 	}
 }
 
-static void finger_scan_interrupt_callback(FpImageDevice *idev, gpointer data, GError *error)
+static void finger_scan_interrupt_callback(FpiUsbTransfer *transfer, FpDevice *dev,
+					   gpointer data, GError *error)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	FpiSsm *ssm = data;
 	int interrupt_type;
 
@@ -1685,7 +1684,7 @@ static void finger_scan_ssm(FpiSsm *ssm, FpDevice *dev)
 	case SCAN_STATE_WAITING_FOR_FINGER:
 	case SCAN_STATE_IN_PROGRESS:
 	case SCAN_STATE_COMPLETED:
-		async_read_from_usb(idev, FP_TRANSFER_INTERRUPT,
+		async_read_from_usb(dev, FP_TRANSFER_INTERRUPT,
 				    vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
 				    finger_scan_interrupt_callback, ssm);
 
@@ -1724,15 +1723,16 @@ static void start_finger_scan(FpImageDevice *idev)
 	fpi_ssm_start(ssm, finger_scan_callback);
 }
 
-static void send_activate_sequence(FpImageDevice *idev, FpiSsm *ssm,
+static void send_activate_sequence(FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 				   int sequence)
 {
-	do_data_exchange(idev, ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+	do_data_exchange(vdev, ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
-static void activate_device_interrupt_callback(FpImageDevice *idev, gpointer data, GError *error)
+static void activate_device_interrupt_callback(FpiUsbTransfer *transfer, FpDevice *dev,
+					       gpointer data, GError *error)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
 	FpiSsm *ssm = data;
 	int interrupt_type;
 
@@ -1763,7 +1763,7 @@ static void activate_ssm(FpiSsm *ssm, FpDevice *dev)
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case ACTIVATE_STATE_GREEN_LED_ON:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+		async_data_exchange(dev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_GREEN_ON, G_N_ELEMENTS(LED_GREEN_ON),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    async_transfer_callback_with_ssm, ssm);
@@ -1776,7 +1776,7 @@ static void activate_ssm(FpiSsm *ssm, FpDevice *dev)
 	case ACTIVATE_STATE_SEQ_6:
 	case ACTIVATE_STATE_SEQ_7:
 	case ACTIVATE_STATE_SCAN_MATRIX:
-		send_activate_sequence(idev, ssm, fpi_ssm_get_cur_state(ssm) - ACTIVATE_STATE_SEQ_1);
+		send_activate_sequence(vdev, ssm, fpi_ssm_get_cur_state(ssm) - ACTIVATE_STATE_SEQ_1);
 		break;
 
 	case ACTIVATE_STATE_WAIT_DEVICE:
@@ -1786,7 +1786,7 @@ static void activate_ssm(FpiSsm *ssm, FpDevice *dev)
 			break;
 		}
 
-		async_read_from_usb(idev, FP_TRANSFER_INTERRUPT,
+		async_read_from_usb(dev, FP_TRANSFER_INTERRUPT,
 				    vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
 				    activate_device_interrupt_callback, ssm);
 		break;
@@ -1821,10 +1821,10 @@ static void dev_activate(FpImageDevice *idev)
 	fpi_ssm_start(ssm, dev_activate_callback);
 }
 
-static void send_deactivate_sequence(FpImageDevice *idev, FpiSsm *ssm,
+static void send_deactivate_sequence(FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 				     int sequence)
 {
-	do_data_exchange(idev, ssm, &DEACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+	do_data_exchange(vdev, ssm, &DEACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
 static void deactivate_ssm(FpiSsm *ssm, FpDevice *dev)
@@ -1843,11 +1843,11 @@ static void deactivate_ssm(FpiSsm *ssm, FpDevice *dev)
 
 	case DEACTIVATE_STATE_SEQ_1:
 	case DEACTIVATE_STATE_SEQ_2:
-		send_deactivate_sequence(idev, ssm, fpi_ssm_get_cur_state(ssm) - DEACTIVATE_STATE_SEQ_1);
+		send_deactivate_sequence(vdev, ssm, fpi_ssm_get_cur_state(ssm) - DEACTIVATE_STATE_SEQ_1);
 		break;
 
 	case DEACTIVATE_STATE_LED_OFF:
-		async_data_exchange(idev, DATA_EXCHANGE_ENCRYPTED,
+		async_data_exchange(dev, DATA_EXCHANGE_ENCRYPTED,
 				    LED_OFF, G_N_ELEMENTS(LED_OFF),
 				    vdev->buffer, VFS_USB_BUFFER_SIZE,
 				    async_transfer_callback_with_ssm, ssm);

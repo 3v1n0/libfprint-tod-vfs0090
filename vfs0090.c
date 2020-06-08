@@ -1994,10 +1994,22 @@ static void fpi_device_vfs0090_init(FpiDeviceVfs0090 *self)
 {
 }
 
+static void fpi_device_vfs0090_dispose(GObject *object)
+{
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(object);
+
+	g_clear_pointer(&vdev->buffer, g_free);
+
+	G_OBJECT_CLASS(fpi_device_vfs0090_parent_class)->dispose(object);
+}
+
 static void fpi_device_vfs0090_class_init(FpiDeviceVfs0090Class *klass)
 {
 	FpDeviceClass *dev_class = FP_DEVICE_CLASS(klass);
 	FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS(klass);
+	GObjectClass *object_class = G_OBJECT_CLASS(klass);
+
+	object_class->dispose = fpi_device_vfs0090_dispose;
 
 	dev_class->id = "vfs0090";
 	dev_class->full_name = "Validity VFS0090";

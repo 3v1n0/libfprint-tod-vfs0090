@@ -1,7 +1,7 @@
 /*
  * Validity VFS0090 driver for libfprint
  * Copyright (C) 2017 Nikita Mikhailov <nikita.s.mikhailov@gmail.com>
- * Copyright (C) 2018 Marco Trevisan <marco@ubuntu.com>
+ * Copyright (C) 2018-2020 Marco Trevisan <marco@ubuntu.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -18,12 +18,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "fp-device.h"
+#include "fpi-device.h"
+#include "fpi-image-device.h"
+#include "fpi-ssm.h"
+#include "fpi-usb-transfer.h"
 #define FP_COMPONENT "vfs0090"
 
+// #include "fpi-device.h"
 #include "drivers_api.h"
-#include <fp_internal.h>
 
 #include <errno.h>
+#include <ctype.h>
 #include <nss.h>
 #include <pk11pub.h>
 #include <sechash.h>
@@ -34,32 +40,30 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "driver_ids.h"
-
 #include "vfs0090.h"
 
 #define STRINGIZE(s) #s
-
-#define EP_IN (1 | LIBUSB_ENDPOINT_IN)
-#define EP_OUT (1 | LIBUSB_ENDPOINT_OUT)
-#define EP_INTERRUPT (LIBUSB_TRANSFER_TYPE_INTERRUPT | LIBUSB_ENDPOINT_IN)
-#define VFS_DEV_FROM_DEV(dev) ((struct vfs_dev_t *) FP_INSTANCE_DATA(dev))
-#define VFS_DEV_FROM_IMG(img) (VFS_DEV_FROM_DEV(FP_DEV(img)))
+#define EP_IN (1 | FPI_USB_ENDPOINT_IN)
+#define EP_OUT (1 | FPI_USB_ENDPOINT_OUT)
+#define VFS0090_TRANSFER_TYPE_INTERRUPT 3 /* Matches LIBUSB_TRANSFER_TYPE_INTERRUPT */
+#define EP_INTERRUPT (VFS0090_TRANSFER_TYPE_INTERRUPT | FPI_USB_ENDPOINT_IN)
 
 /* The main driver structure */
-struct vfs_dev_t {
+struct _FpiDeviceVfs0090 {
+	FpImageDevice parent;
+
 	/* Buffer for saving usb data through states */
 	unsigned char *buffer;
-	unsigned int buffer_length;
+	int buffer_length;
 
 	/* TLS keyblock for current session */
 	unsigned char key_block[0x120];
 
-	/* Current async transfer */
-	struct libusb_transfer *transfer;
-
-	struct fpi_timeout *timeout;
+	/* Current action cancellable */
+	GCancellable *cancellable;
 };
+
+G_DEFINE_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FP_TYPE_IMAGE_DEVICE)
 
 struct vfs_init_t {
 	unsigned char *main_seed;
@@ -73,7 +77,7 @@ struct vfs_init_t {
 /* DEBUGGG */
 #include <stdio.h>
 
-void print_hex_gn(unsigned char *data, int len, int sz) {
+static void print_hex_gn(unsigned char *data, int len, int sz) {
 	if (!len || !data)
 		return;
 
@@ -109,201 +113,171 @@ void print_hex_gn(unsigned char *data, int len, int sz) {
 	puts("");
 }
 
-void print_hex_string(char *data, int len) {
+static void print_hex_string(char *data, int len) {
 	for (int i = 0; i < len; i++) {
 		printf("%02x", data[i]);
 	}
 	puts("");
 }
 
-void print_hex(unsigned char *data, int len) {
+static void print_hex(unsigned char *data, int len) {
 	print_hex_gn(data, len, 1);
 }
 
 /* remove emmmeeme */
-static void start_reactivate_subsm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm);
+static void start_reactivate_subsm(FpDevice *dev,
+				   FpiSsm *parent_ssm);
 
-static unsigned char *tls_encrypt(struct fp_img_dev *idev,
+static unsigned char *tls_encrypt(FpImageDevice *idev,
 				  const unsigned char *data, int data_size,
 				  int *encrypted_len_out);
-static gboolean tls_decrypt(struct fp_img_dev *idev,
+static gboolean tls_decrypt(FpImageDevice *idev,
 			    const unsigned char *buffer, int buffer_size,
 			    unsigned char *output_buffer, int *output_len);
 
-typedef void (*async_operation_cb)(struct fp_img_dev *idev, int status, void *data);
+typedef void (*async_operation_cb)(FpImageDevice *idev, gpointer data, GError *error);
 
 struct async_usb_operation_data_t {
-	struct fp_img_dev *idev;
 	async_operation_cb callback;
 	void *callback_data;
-
-	gboolean completed;
 };
 
-static int usb_error_to_fprint_fail(struct fp_img_dev *idev, int status)
+static void async_write_callback(FpiUsbTransfer *transfer, FpDevice *device,
+				 gpointer user_data, GError *error)
 {
-	if (status == LIBUSB_TRANSFER_CANCELLED)
-		return status;
+	struct async_usb_operation_data_t *op_data = user_data;
+	FpiDeviceVfs0090 *vdev;
 
-	switch (fpi_imgdev_get_action(idev)) {
-	case IMG_ACTION_ENROLL:
-		status = FP_ENROLL_FAIL;
-		break;
-	case IMG_ACTION_VERIFY:
-	case IMG_ACTION_IDENTIFY:
-		status = FP_VERIFY_RETRY;
-		break;
-	case IMG_ACTION_CAPTURE:
-		status = FP_CAPTURE_FAIL;
-		break;
-	case IMG_ACTION_NONE:
-		break;
-	}
-
-	return status;
-}
-
-static gboolean async_transfer_completed(struct fp_img_dev *idev)
-{
-	struct async_usb_operation_data_t *op_data;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-
-	if (!vdev->transfer)
-		return TRUE;
-
-	op_data = vdev->transfer->user_data;
-	return op_data->completed;
-}
-
-static void async_write_callback(struct libusb_transfer *transfer)
-{
-	struct async_usb_operation_data_t *op_data = transfer->user_data;
-	struct fp_img_dev *idev = op_data->idev;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-
-	op_data->completed = TRUE;
-
-	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+	if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 		fp_dbg("USB write transfer cancelled");
-		goto out;
+		g_free(op_data);
+		return;
 	}
 
-	if (transfer->status != 0) {
-		fp_err("USB write transfer error: %s", libusb_error_name(transfer->status));
-		fpi_imgdev_session_error(idev, -transfer->status);
+	vdev = FPI_DEVICE_VFS0090(device);
+	g_clear_object(&vdev->cancellable);
+
+	if (error) {
+		fp_err("USB write transfer error: %s", error->message);
+		fpi_device_action_error(device, error);
 		goto out;
 	}
 
 	if (transfer->actual_length != transfer->length) {
-		fp_err("Written only %d of %d bytes",
-		       transfer->actual_length, transfer->length);
-		fpi_imgdev_session_error(idev, -EIO);
+		error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+						  "Written only %lu of %lu bytes",
+						  transfer->length,
+						  transfer->actual_length);
+		fp_err("%s", error->message);
+		fpi_device_action_error(device, error);
 		goto out;
 	}
 
 out:
-	vdev->transfer = NULL;
-
 	if (op_data->callback)
-		op_data->callback(idev, transfer->status, op_data->callback_data);
+		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
 
 	g_free(op_data);
 }
 
-static void async_write_to_usb(struct fp_img_dev *idev,
+static void async_write_to_usb(FpImageDevice *idev,
 			       const unsigned char *data, int data_size,
 			       async_operation_cb callback, void* callback_data)
 {
 	struct async_usb_operation_data_t *op_data;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiUsbTransfer *transfer;
 
-	g_assert(async_transfer_completed(idev));
-
-	vdev->transfer = libusb_alloc_transfer(0);
-	vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
+	g_assert_true(!vdev->cancellable ||
+	              g_cancellable_is_cancelled(vdev->cancellable));
 
 	op_data = g_new0(struct async_usb_operation_data_t, 1);
-	op_data->idev = idev;
 	op_data->callback = callback;
 	op_data->callback_data = callback_data;
 
-	libusb_fill_bulk_transfer(vdev->transfer, fpi_dev_get_usb_dev(FP_DEV(idev)),
-				  EP_OUT, (unsigned char *) data, data_size,
-				  async_write_callback, op_data, VFS_USB_TIMEOUT);
-	libusb_submit_transfer(vdev->transfer);
+	transfer = fpi_usb_transfer_new(FP_DEVICE(idev));
+	fpi_usb_transfer_fill_bulk_full(transfer, EP_OUT,
+					(guint8 *) data, data_size, NULL);
+	// fpi_usb_transfer_fill_bulk_full(transfer, EP_OUT,
+					// (unsigned char *)data, data_size, NULL);
+	// fpi_usb_transfer_submit(transfer, VFS_USB_TIMEOUT, NULL,
+				// async_write_callback, op_data);
+	// fpi_usb_transfer_unref(transfer);
+	g_set_object(&vdev->cancellable, g_cancellable_new ());
+	fpi_usb_transfer_submit(transfer, VFS_USB_TIMEOUT,
+				vdev->cancellable,
+				async_write_callback, op_data);
 }
 
-static void async_read_callback(struct libusb_transfer *transfer)
+static void async_read_callback(FpiUsbTransfer *transfer, FpDevice *device,
+				gpointer user_data, GError *error)
 {
-	struct async_usb_operation_data_t *op_data = transfer->user_data;
-	struct fp_img_dev *idev;
-	struct vfs_dev_t *vdev;
+	struct async_usb_operation_data_t *op_data = user_data;
+	FpiDeviceVfs0090 *vdev;
 
-	idev = op_data->idev;
-	vdev = VFS_DEV_FROM_IMG(idev);
-	vdev->buffer_length = 0;
-
-	if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+	if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 		fp_dbg("USB read transfer cancelled");
-		goto out;
+		g_free(op_data);
+		return;
 	}
 
-	if (transfer->status != 0) {
+	vdev = FPI_DEVICE_VFS0090(device);
+	vdev->buffer_length = 0;
+	g_clear_object(&vdev->cancellable);
+
+	if (error) {
 		fp_err("USB read transfer error: %s",
-		       libusb_error_name(transfer->status));
-		fpi_imgdev_session_error(idev, -transfer->status);
+		       error->message);
+		fpi_device_action_error(device, error);
 		goto out;
 	}
 
 	vdev->buffer_length = transfer->actual_length;
 
 out:
-	vdev->transfer = NULL;
-
 	if (op_data->callback)
-		op_data->callback(idev, transfer->status, op_data->callback_data);
+		op_data->callback(FP_IMAGE_DEVICE(device), op_data->callback_data, error);
 
 	g_free(op_data);
 }
 
-static void async_read_from_usb(struct fp_img_dev *idev, int read_mode,
+static void async_read_from_usb(FpImageDevice *idev, FpiTransferType transfer_type,
 				unsigned char *buffer, int buffer_size,
 				async_operation_cb callback, void* callback_data)
 {
 	struct async_usb_operation_data_t *op_data;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiUsbTransfer *transfer;
+	guint timeout = VFS_USB_TIMEOUT;
 
-	g_assert(async_transfer_completed(idev));
+	g_assert_true(!vdev->cancellable ||
+	              g_cancellable_is_cancelled(vdev->cancellable));
 
-	vdev->transfer = libusb_alloc_transfer(0);
-	vdev->transfer->flags |= LIBUSB_TRANSFER_FREE_TRANSFER;
+	transfer = fpi_usb_transfer_new(FP_DEVICE(idev));
+	g_set_object(&vdev->cancellable, g_cancellable_new());
 
 	op_data = g_new0(struct async_usb_operation_data_t, 1);
-	op_data->idev = idev;
 	op_data->callback = callback;
 	op_data->callback_data = callback_data;
 
-	switch (read_mode) {
-	case VFS_READ_INTERRUPT:
-		libusb_fill_interrupt_transfer(vdev->transfer,
-		                               fpi_dev_get_usb_dev(FP_DEV(idev)),
-					       EP_INTERRUPT,
-					       buffer, buffer_size,
-					       async_read_callback, op_data,
-					       VFS_USB_INTERRUPT_TIMEOUT);
+	switch (transfer_type) {
+	case FP_TRANSFER_INTERRUPT:
+		timeout = 0;
+		fpi_usb_transfer_fill_interrupt_full (transfer,
+						      EP_INTERRUPT, buffer,
+						      buffer_size, NULL);
 		break;
-	case VFS_READ_BULK:
-		libusb_fill_bulk_transfer(vdev->transfer,
-		                          fpi_dev_get_usb_dev(FP_DEV(idev)), EP_IN,
-					  buffer, buffer_size,
-					  async_read_callback, op_data,
-					  VFS_USB_TIMEOUT);
+	case FP_TRANSFER_BULK:
+		fpi_usb_transfer_fill_bulk_full(transfer, EP_IN,
+						(guint8 *) buffer, buffer_size, NULL);
 		break;
 	default:
 		g_assert_not_reached();
 	}
 
-	libusb_submit_transfer(vdev->transfer);
+	fpi_usb_transfer_submit(transfer, timeout,
+				vdev->cancellable,
+				async_read_callback, op_data);
 }
 
 struct async_usb_encrypted_operation_data_t {
@@ -314,20 +288,22 @@ struct async_usb_encrypted_operation_data_t {
 	int encrypted_data_size;
 };
 
-static void async_write_encrypted_callback(struct fp_img_dev *idev, int status, void *data)
+static void async_write_encrypted_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
 	struct async_usb_encrypted_operation_data_t *enc_op = data;
 
 	if (enc_op->callback)
-		enc_op->callback(idev, status, enc_op->callback_data);
+		enc_op->callback(idev, enc_op->callback_data, error);
 
 	free(enc_op->encrypted_data);
 	free(enc_op);
 }
 
-static void async_write_encrypted_to_usb(struct fp_img_dev *idev,
-					const unsigned char *data, int data_size,
-					async_operation_cb callback, void* callback_data)
+static void async_write_encrypted_to_usb(FpImageDevice *idev,
+					 const unsigned char *data,
+					 int data_size,
+					 async_operation_cb callback,
+					 void* callback_data)
 {
 	struct async_usb_encrypted_operation_data_t *enc_op;
 	unsigned char *encrypted_data;
@@ -346,30 +322,32 @@ static void async_write_encrypted_to_usb(struct fp_img_dev *idev,
 			   async_write_encrypted_callback, enc_op);
 }
 
-static void async_read_encrypted_callback(struct fp_img_dev *idev, int status, void *data)
+static void async_read_encrypted_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
 	struct async_usb_encrypted_operation_data_t *enc_op = data;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	enc_op->encrypted_data = g_memdup(vdev->buffer, vdev->buffer_length);
 	enc_op->encrypted_data_size = vdev->buffer_length;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED &&
+	if (!error &&
 	    enc_op->encrypted_data && enc_op->encrypted_data_size &&
 	    !tls_decrypt(idev, enc_op->encrypted_data,
 			 enc_op->encrypted_data_size,
 			 vdev->buffer, &vdev->buffer_length)) {
-		status = LIBUSB_TRANSFER_ERROR;
+		error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+						  "Impossible to decrypt "
+						  "received data");
 	}
 
 	if (enc_op->callback)
-		enc_op->callback(idev, status, enc_op->callback_data);
+		enc_op->callback(idev, enc_op->callback_data, error);
 
 	free(enc_op->encrypted_data);
 	free(enc_op);
 }
 
-static void async_read_decrypt_from_usb(struct fp_img_dev *idev, int read_mode,
+static void async_read_decrypt_from_usb(FpImageDevice *idev, FpiTransferType transfer_type,
 					unsigned char *buffer, int buffer_size,
 					async_operation_cb callback, void* callback_data)
 {
@@ -379,7 +357,7 @@ static void async_read_decrypt_from_usb(struct fp_img_dev *idev, int read_mode,
 	enc_op->callback = callback;
 	enc_op->callback_data = callback_data;
 
-	async_read_from_usb(idev, read_mode, buffer, buffer_size,
+	async_read_from_usb(idev, transfer_type, buffer, buffer_size,
 			    async_read_encrypted_callback, enc_op);
 }
 
@@ -392,32 +370,31 @@ struct async_data_exchange_t {
 	int buffer_size;
 };
 
-static void on_async_data_exchange_cb(struct fp_img_dev *idev,
-				      int status, void *data)
+static void on_async_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *error)
 {
 	struct async_data_exchange_t *dex = data;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
+	if (!error) {
 		if (dex->exchange_mode == DATA_EXCHANGE_PLAIN) {
-			async_read_from_usb(idev, VFS_READ_BULK,
+			async_read_from_usb(idev, FP_TRANSFER_BULK,
 					    dex->buffer,
 					    dex->buffer_size,
 					    dex->callback, dex->callback_data);
 		} else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED) {
-			async_read_decrypt_from_usb(idev, VFS_READ_BULK,
+			async_read_decrypt_from_usb(idev, FP_TRANSFER_BULK,
 						    dex->buffer,
 						    dex->buffer_size,
 						    dex->callback,
 						    dex->callback_data);
 		}
 	} else if (dex->callback) {
-		dex->callback(idev, status, dex->callback_data);
+		dex->callback(idev, dex->callback_data, error);
 	}
 
 	g_free(dex);
 }
 
-static void async_data_exchange(struct fp_img_dev *idev, int exchange_mode,
+static void async_data_exchange(FpImageDevice *idev, int exchange_mode,
 				const unsigned char *data, int data_size,
 				unsigned char *buffer, int buffer_size,
 				async_operation_cb callback, void* callback_data)
@@ -438,49 +415,63 @@ static void async_data_exchange(struct fp_img_dev *idev, int exchange_mode,
 		async_write_encrypted_to_usb(idev, data, data_size,
 					     on_async_data_exchange_cb, dex);
 	} else {
-		fp_err("Unknown exchange mode selected\n");
-		fpi_imgdev_session_error(idev, -EIO);
+		GError *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
+							 "Unknown exchange mode selected");
+		fp_err("%s", error->message);
+		fpi_device_action_error(FP_DEVICE(idev), error);
 	}
 }
 
-static void async_transfer_callback_with_ssm(struct fp_img_dev *idev,
-					     int status, void *data)
+static void async_transfer_callback_with_ssm(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct fpi_ssm *ssm = data;
+	FpiSsm *ssm = data;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
+	if (!error) {
 		fpi_ssm_next_state(ssm);
 	} else {
-		fpi_imgdev_session_error(idev, -status);
-		fpi_ssm_mark_failed(ssm, status);
+		fpi_device_action_error(FP_DEVICE(idev), error);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void generate_main_seed(struct fp_img_dev *idev, struct vfs_init_t *vinit) {
+static void generate_main_seed(FpImageDevice *idev, struct vfs_init_t *vinit) {
 	char name[NAME_MAX], serial[NAME_MAX];
 	FILE *name_file, *serial_file;
 	int name_len, serial_len;
+	GError *error = NULL;
 
 	if (!(name_file = fopen(DMI_PRODUCT_NAME_NODE, "r"))) {
-		fp_err("Can't open " DMI_PRODUCT_NAME_NODE);
-		fpi_imgdev_session_error(idev, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_NOT_FOUND,
+						 "Can't open "
+						 DMI_PRODUCT_NAME_NODE);
+		fp_err("%s", error->message);
+		fpi_device_action_error(FP_DEVICE(idev), error);
 		return;
 	}
 	if (!(serial_file = fopen(DMI_PRODUCT_SERIAL_NODE, "r"))) {
-		fp_err("Can't open " DMI_PRODUCT_SERIAL_NODE);
-		fpi_imgdev_session_error(idev, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_NOT_FOUND,
+						 "Can't open "
+						 DMI_PRODUCT_SERIAL_NODE);
+		fp_err("%s", error->message);
+		fpi_device_action_error(FP_DEVICE(idev), error);
 		goto out_serial;
 	}
 
 	if (fscanf(name_file, "%s", name) != 1) {
-		fp_err("Can't parse product name from " DMI_PRODUCT_NAME_NODE);
-		fpi_imgdev_session_error(idev, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
+						 "Can't parse product name from "
+						 DMI_PRODUCT_NAME_NODE);
+		fp_err("%s", error->message);
+		fpi_device_action_error(FP_DEVICE(idev), error);
 		goto out_closeall;
 	}
 
 	if (fscanf(serial_file, "%s", serial) != 1) {
-		fp_err("Can't parse product name from " DMI_PRODUCT_SERIAL_NODE);
-		fpi_imgdev_session_error(idev, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
+						 "Can't parse product name from "
+						 DMI_PRODUCT_SERIAL_NODE);
+		fp_err("%s", error->message);
+		fpi_device_action_error(FP_DEVICE(idev), error);
 		goto out_closeall;
 	}
 
@@ -498,18 +489,17 @@ out_serial:
 	fclose(name_file);
 }
 
-#define usb_operation(func, dev) usb_operation_perform(STRINGIZE(func), func, idev)
-static gboolean usb_operation_perform(const char *op, int error, struct fp_img_dev *idev)
+#define usb_operation(func, dev, error) usb_operation_perform(STRINGIZE(func), func, dev, error)
+static gboolean usb_operation_perform(const char *op, gboolean ret, FpDevice *dev, GError *error)
 {
-	if (error != 0) {
-		fp_err("USB operation '%s' failed: %s", op, libusb_error_name(error));
-		if (idev) {
-			fpi_imgdev_session_error(idev, -EIO);
+	if (!ret && error) {
+		fp_err("USB operation '%s' failed: %s", op, error->message);
+		if (dev) {
+			fpi_device_action_error(dev, error);
 		}
-		return FALSE;
 	}
 
-	return TRUE;
+	return ret;
 }
 
 /*
@@ -517,8 +507,9 @@ static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 {
 	if (ret != TRUE) {
 		fp_err("OpenSSL operation failed: %d", ret);
-		if (idev) {
-			fpi_imgdev_session_error(idev, -EIO);
+		error = fpi_device_error_new_msg FP_DEVICE_ERROR_GENERAL,
+						 (idev) {
+			fpi_image_device_session_error(idev, error);
 		}
 		return FALSE;
 	}
@@ -526,15 +517,6 @@ static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
 	return TRUE;
 }
 */
-
-static void timeout_fpi_ssm_next_state(struct fp_dev *dev, void *data)
-{
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_DEV(dev);
-	struct fpi_ssm *ssm = data;
-
-	vdev->timeout = NULL;
-	fpi_ssm_next_state(ssm);
-}
 
 static PK11Context* hmac_make_context(const unsigned char *key_bytes, int key_len)
 {
@@ -565,7 +547,7 @@ static unsigned char* hmac_compute(const unsigned char *key, int key_len, unsign
 	PK11Context* context = hmac_make_context(key, key_len);
 	PK11_DigestOp(context, data, data_len);
 
-	int len = 0x20;
+	unsigned int len = 0x20;
 	unsigned char *res = malloc(len);
 	PK11_DigestFinal(context, res, &len, len);
 	PK11_DestroyContext(context, PR_TRUE);
@@ -622,14 +604,14 @@ static void mac_then_encrypt(unsigned char type, unsigned char *key_block, const
 	EVP_CIPHER_CTX_free(context);
 }
 
-static unsigned char *tls_encrypt(struct fp_img_dev *idev,
+static unsigned char *tls_encrypt(FpImageDevice *idev,
 				  const unsigned char *data, int data_size,
 				  int *encrypted_len_out) {
-	struct vfs_dev_t *vdev;
+	FpiDeviceVfs0090 *vdev;
 	unsigned char *res, *wr;
 	int res_len;
 
-	vdev = VFS_DEV_FROM_IMG(idev);
+	vdev = FPI_DEVICE_VFS0090(idev);
 	g_assert(vdev->key_block);
 
 	mac_then_encrypt(0x17, vdev->key_block, data, data_size, &res, &res_len);
@@ -645,11 +627,11 @@ static unsigned char *tls_encrypt(struct fp_img_dev *idev,
 	return wr;
 }
 
-static gboolean tls_decrypt(struct fp_img_dev *idev,
+static gboolean tls_decrypt(FpImageDevice *idev,
 			    const unsigned char *buffer, int buffer_size,
 			    unsigned char *output_buffer, int *output_len)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	int buff_len = buffer_size - 5;
 	int out_len = buff_len - 0x10;
@@ -693,7 +675,7 @@ static gboolean tls_decrypt(struct fp_img_dev *idev,
 	return ret;
 }
 
-static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
+static gboolean check_data_exchange(FpiDeviceVfs0090 *vdev, const struct data_exchange_t *dex)
 {
 	if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
 		return FALSE;
@@ -716,13 +698,13 @@ static gboolean check_data_exchange(struct vfs_dev_t *vdev, const struct data_ex
 	return TRUE;
 }
 
-static gboolean check_data_exchange_dbg(struct vfs_dev_t *vdev, const struct data_exchange_t *dex)
+static gboolean check_data_exchange_dbg(FpiDeviceVfs0090 *vdev, const struct data_exchange_t *dex)
 {
 	gboolean ret = check_data_exchange(vdev, dex);
 
 	if (!ret) {
 		if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length) {
-			fp_err("Expected len: %d, but got %d\n",
+			fp_err("Expected len: %d, but got %d",
 			       dex->rsp_length, vdev->buffer_length);
 		}
 
@@ -733,38 +715,39 @@ static gboolean check_data_exchange_dbg(struct vfs_dev_t *vdev, const struct dat
 }
 
 struct data_exchange_async_data_t {
-	struct fpi_ssm *ssm;
+	FpiSsm *ssm;
 	const struct data_exchange_t *dex;
 };
 
-static void on_data_exchange_cb(struct fp_img_dev *idev, int status, void *data)
+static void on_data_exchange_cb(FpImageDevice *idev, gpointer data, GError *error)
 {
 	struct data_exchange_async_data_t *dex_data = data;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
+	if (!error) {
 		if (check_data_exchange_dbg(vdev, dex_data->dex)) {
 			fpi_ssm_next_state(dex_data->ssm);
 		} else {
-			status = LIBUSB_TRANSFER_ERROR;
+			error = fpi_device_error_new (FP_DEVICE_ERROR_PROTO);
 		}
 	}
 
-	if (status != LIBUSB_TRANSFER_COMPLETED) {
+	if (error) {
 		fp_err("Data exchange failed at state %d, usb error: %s",
-			fpi_ssm_get_cur_state(dex_data->ssm), libusb_error_name(status));
-		if (status != LIBUSB_TRANSFER_CANCELLED)
-			fpi_imgdev_session_error(idev, -EIO);
+			fpi_ssm_get_cur_state(dex_data->ssm), error->message);
+		if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			fpi_image_device_session_error(idev, error);
 
-		fpi_ssm_mark_failed(dex_data->ssm, status);
+		fpi_ssm_mark_failed(dex_data->ssm, error);
 	}
 
 	g_free(dex_data);
 }
 
-static void do_data_exchange(struct fp_img_dev *idev, struct fpi_ssm *ssm, const struct data_exchange_t *dex, int mode)
+static void do_data_exchange(FpImageDevice *idev, FpiSsm *ssm,
+			     const struct data_exchange_t *dex, int mode)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 	struct data_exchange_async_data_t *dex_data;
 
 	dex_data = g_new0(struct data_exchange_async_data_t, 1);
@@ -776,7 +759,7 @@ static void do_data_exchange(struct fp_img_dev *idev, struct fpi_ssm *ssm, const
 			    on_data_exchange_cb, dex_data);
 }
 
-static void TLS_PRF2(const unsigned char *secret, int secret_len, char *str,
+static void TLS_PRF2(const unsigned char *secret, int secret_len, const char *str,
 		     const unsigned char *seed40, int seed40_len,
 		     unsigned char *out_buffer, int buffer_len)
 {
@@ -959,7 +942,7 @@ static unsigned char *sign2(EC_KEY* key, unsigned char *data, int data_len) {
 }
 
 struct tls_handshake_t {
-	struct fpi_ssm *parent_ssm;
+	FpiSsm *parent_ssm;
 	struct vfs_init_t *vinit;
 	HASHContext *tls_hash_context;
 	HASHContext *tls_hash_context2;
@@ -969,12 +952,13 @@ struct tls_handshake_t {
 	unsigned char *client_hello;
 };
 
-static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void handshake_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct tls_handshake_t *tlshd = data;
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	struct tls_handshake_t *tlshd = fpi_ssm_get_data(ssm);
 	struct vfs_init_t *vinit = tlshd->vinit;
+	GError *error = NULL;
 
 	switch(fpi_ssm_get_cur_state(ssm)) {
 	case TLS_HANDSHAKE_STATE_CLIENT_HELLO:
@@ -1023,14 +1007,18 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		HASH_Update(tlshd->tls_hash_context2, tlshd->read_buffer + 0x05, 0x3d);
 
 		if (!(priv_key = load_key(PRIVKEY, TRUE))) {
-			fp_err("Impossible to load private key");
-			fpi_ssm_mark_failed(ssm, -EIO);
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
+							 "Impossible to load private key");
+			fp_err("%s", error->message);
+			fpi_ssm_mark_failed(ssm, error);
 			break;
 		}
 
 		if (!(pub_key = load_key(vinit->pubkey, FALSE))) {
-			fp_err("Impossible to load private key");
-			fpi_ssm_mark_failed(ssm, -EIO);
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
+							 "Impossible to load private key");
+			fp_err("%s", error->message);
+			fpi_ssm_mark_failed(ssm, error);
 			break;
 		}
 
@@ -1048,9 +1036,13 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 
 		pre_master_secret = malloc(pre_master_secret_len);
 		if (!ECDH_compute_key(pre_master_secret, pre_master_secret_len, EC_KEY_get0_public_key(pub_key), priv_key, NULL)) {
-			fp_err("Failed to compute key, error: %lu, %s",
-			ERR_peek_last_error(), ERR_error_string(ERR_peek_last_error(), NULL));
-			fpi_ssm_mark_failed(ssm, ERR_peek_last_error());
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
+							 "Failed to compute key, "
+							 "error: %lu, %s",
+							 ERR_peek_last_error(),
+							 ERR_error_string(ERR_peek_last_error(), NULL));
+			fp_err("%s", error->message);
+			fpi_ssm_mark_failed(ssm, error);
 			g_free(pre_master_secret);
 			break;
 		}
@@ -1082,7 +1074,8 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		EC_KEY *ecdsa_key;
 		unsigned char test[0x20];
 		unsigned char *cert_verify_signature, *final;
-		int len, test_len;
+		unsigned int test_len;
+		int len;
 
 		memcpy(vinit->tls_certificate + 0xce + 4, PRIVKEY, 0x40);
 
@@ -1096,7 +1089,8 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		memcpy(vinit->tls_certificate + 0x09 + 0x109 + 0x04, cert_verify_signature, VFS_ECDSA_SIGNATURE_SIZE);
 
 		// encrypted finished
-		unsigned char handshake_messages[0x20]; int len3 = 0x20;
+		unsigned char handshake_messages[0x20];
+		unsigned int len3 = 0x20;
 		HASH_Update(tlshd->tls_hash_context2, vinit->tls_certificate + 0x09 + 0x109, 0x4c);
 		HASH_End(tlshd->tls_hash_context2, handshake_messages, &len3, 0x20);
 
@@ -1136,8 +1130,10 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		if (vdev->buffer_length < 50 ||
 		    memcmp(tlshd->read_buffer, WRONG_TLS_CERT_RSP,
 		           MIN(vdev->buffer_length, G_N_ELEMENTS(WRONG_TLS_CERT_RSP))) == 0) {
-			fp_err("TLS Certificate submitted isn't accepted by reader");
-			fpi_ssm_mark_failed(ssm, -EIO);
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
+							 "TLS Certificate submitted isn't accepted by reader");
+			fp_err("%s", error->message);
+			fpi_ssm_mark_failed(ssm, error);
 			break;
 		}
 
@@ -1146,21 +1142,20 @@ static void handshake_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		break;
 	}
 	default:
-		fp_err("Unknown state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void handshake_ssm_cb(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void handshake_ssm_cb(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct tls_handshake_t *tlshd = data;
-	struct fpi_ssm *parent_ssm = tlshd->parent_ssm;
+	struct tls_handshake_t *tlshd = fpi_ssm_get_data(ssm);
+	FpiSsm *parent_ssm = tlshd->parent_ssm;
 
-	if (fpi_ssm_get_error(ssm)) {
-		fpi_imgdev_session_error(idev, fpi_ssm_get_error(ssm));
-		fpi_ssm_mark_failed(parent_ssm, fpi_ssm_get_error(ssm));
+	if (error) {
+		fpi_ssm_mark_failed(parent_ssm, error);
 	} else {
 		fpi_ssm_next_state(parent_ssm);
 	}
@@ -1169,19 +1164,22 @@ static void handshake_ssm_cb(struct fpi_ssm *ssm, struct fp_dev *dev, void *data
 	HASH_Destroy(tlshd->tls_hash_context2);
 	g_clear_pointer(&tlshd->client_hello, g_free);
 	g_free(tlshd);
-	fpi_ssm_free(ssm);
 }
 
-static void start_handshake_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm, struct vfs_init_t *vinit)
+static void start_handshake_ssm(FpImageDevice *idev,
+				FpiSsm *parent_ssm,
+				struct vfs_init_t *vinit)
 {
-	struct fpi_ssm *ssm;
+	FpiSsm *ssm;
 	struct tls_handshake_t *tlshd;
 
 	tlshd = g_new0(struct tls_handshake_t, 1);
 	tlshd->parent_ssm = parent_ssm;
 	tlshd->vinit = vinit;
 
-	ssm = fpi_ssm_new(FP_DEV(idev), handshake_ssm, TLS_HANDSHAKE_STATE_LAST, tlshd);
+	ssm = fpi_ssm_new(FP_DEVICE(idev), handshake_ssm,
+			  TLS_HANDSHAKE_STATE_LAST);
+	fpi_ssm_set_data(ssm, tlshd, NULL);
 	fpi_ssm_start(ssm, handshake_ssm_cb);
 }
 
@@ -1232,25 +1230,24 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 	if (sizeof(low_quality_scan) == interrupt_size &&
 	    memcmp(low_quality_scan, interrupt, interrupt_size) == 0) {
 		fp_info("Fingerprint scan success, but low quality...");
-		printf("ALTERNATIVE SCAN, let's see this result!!!!\n");
 		return VFS_SCAN_SUCCESS_LOW_QUALITY;
 	}
 
 	if (sizeof(scan_failed_too_short) == interrupt_size &&
 	    memcmp(scan_failed_too_short, interrupt, interrupt_size) == 0) {
-		fp_err("Impossible to read fingerprint, don't move your finger");
+		fp_warn("Impossible to read fingerprint, don't move your finger");
 		return VFS_SCAN_FAILED_TOO_SHORT;
 	}
 
 	if (sizeof(scan_failed_too_short2) == interrupt_size &&
 	    memcmp(scan_failed_too_short2, interrupt, interrupt_size) == 0) {
-		fp_err("Impossible to read fingerprint, don't move your finger (2)");
+		fp_warn("Impossible to read fingerprint, don't move your finger (2)");
 		return VFS_SCAN_FAILED_TOO_SHORT;
 	}
 
 	if (sizeof(scan_failed_too_fast) == interrupt_size &&
 	    memcmp(scan_failed_too_fast, interrupt, interrupt_size) == 0) {
-		fp_err("Impossible to read fingerprint, movement was too fast");
+		fp_warn("Impossible to read fingerprint, movement was too fast");
 		return VFS_SCAN_FAILED_TOO_FAST;
 	}
 
@@ -1260,17 +1257,19 @@ static int translate_interrupt(unsigned char *interrupt, int interrupt_size)
 	return VFS_SCAN_UNKNOWN;
 }
 
-static void send_init_sequence(struct fp_img_dev *idev, struct fpi_ssm *ssm, int sequence)
+static void send_init_sequence(FpImageDevice *idev, FpiSsm *ssm,
+			       int sequence)
 {
 	do_data_exchange(idev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
 }
 
 /* Main SSM loop */
-static void init_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_DEV(dev);
-	struct vfs_init_t *vinit = data;
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
+	struct vfs_init_t *vinit = fpi_ssm_get_data(ssm);
+	GError *error = NULL;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case INIT_STATE_GENERATE_MAIN_SEED:
@@ -1281,15 +1280,18 @@ static void init_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 	case INIT_STATE_SEQ_2:
 		if (vdev->buffer_length == 38) {
 			if (vdev->buffer[vdev->buffer_length-1] != 0x07) {
-				fp_err("Sensor not initialized, init byte is 0x%x " \
-				"(should be 0x07 on initialized devices, 0x02 " \
-				"otherwise)\n" \
-				"This is a driver in alpha state and the " \
-				"device needs to be setup in a VirtualBox " \
-				"instance running Windows, or with a native " \
-				"Windows installation first.",
-				vdev->buffer[vdev->buffer_length-1]);
-				fpi_ssm_mark_failed(ssm, -EIO);
+				error = fpi_device_error_new_msg(
+						FP_DEVICE_ERROR_NOT_SUPPORTED,
+						"Sensor not initialized, init byte is 0x%x " \
+						"(should be 0x07 on initialized devices, 0x02 " \
+						"otherwise)\n" \
+						"This is a driver in alpha state and the " \
+						"device needs to be setup in a VirtualBox " \
+						"instance running Windows, or with a native " \
+						"Windows installation first.",
+						vdev->buffer[vdev->buffer_length-1]);
+				fp_err("%s", error->message);
+				fpi_ssm_mark_failed(ssm, error);
 				break;
 			}
 		} else {
@@ -1318,7 +1320,7 @@ static void init_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		if (make_ecdsa_key(vinit, vdev->buffer)) {
 			fpi_ssm_next_state(ssm);
 		} else if (memcmp(TEST_SEED, vinit->main_seed, vinit->main_seed_length) != 0) {
-			fp_warn("Failed using system seed for ECDSA key generation, "
+			fp_info("Failed using system seed for ECDSA key generation, "
 				"trying with a VirtualBox one");
 
 			g_clear_pointer(&vinit->main_seed, g_free);
@@ -1328,10 +1330,12 @@ static void init_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 
 			fpi_ssm_jump_to_state(ssm, INIT_STATE_MASTER_KEY);
 		} else {
-			fp_err("Initialization failed at state %d, ECDSA key generation",
-			       fpi_ssm_get_cur_state(ssm));
-			fpi_imgdev_session_error(idev, -EIO);
-			fpi_ssm_mark_failed(ssm, -EIO);
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO,
+					"Initialization failed at state %d, "
+					"ECDSA key generation",
+					fpi_ssm_get_cur_state(ssm));
+			fp_err("%s", error->message);
+			fpi_ssm_mark_failed(ssm, error);
 		}
 		break;
 
@@ -1361,152 +1365,151 @@ static void init_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		break;
 
 	default:
-		fp_err("Unknown state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown init state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
 /* Callback for dev_open ssm */
-static void dev_open_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void dev_open_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
 	/* Notify open complete */
-	struct fp_img_dev *idev = FP_IMG_DEV (dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_DEV(dev);
-	struct vfs_init_t *vinit = data;
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
+	struct vfs_init_t *vinit = fpi_ssm_get_data(ssm);
 
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
 	if (fpi_ssm_get_error(ssm))
-		fpi_imgdev_session_error(idev, fpi_ssm_get_error(ssm));
+		fpi_image_device_session_error(idev, error);
 
-	fpi_imgdev_open_complete(idev, fpi_ssm_get_error(ssm));
+	fpi_image_device_open_complete(idev, error);
 
 	g_free(vinit->main_seed);
 	g_free(vinit);
-	fpi_ssm_free(ssm);
 }
 
 /* Open device */
-static int dev_open(struct fp_img_dev *idev, unsigned long driver_data)
+static void dev_open(FpImageDevice *idev)
 {
-	struct fp_dev *dev = FP_DEV(idev);
-	struct fpi_ssm *ssm;
-	struct vfs_dev_t *vdev;
-	libusb_device_handle *udev;
+	FpDevice *dev = FP_DEVICE(idev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
+	FpiSsm *ssm;
+	GUsbDevice *udev;
+	GError *error = NULL;
 	SECStatus secs_status;
 	int usb_config;
 
 	secs_status = NSS_NoDB_Init(NULL);
 	if (secs_status != SECSuccess) {
-		fp_err("could not initialise NSS");
-		return -1;
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "could not initialise NSS");
+		fp_err("%s", error->message);
+		fpi_image_device_open_complete(idev, error);
+		return;
 	}
 
 	OpenSSL_add_all_algorithms();
 	ERR_load_crypto_strings();
 
 	/* Initialize private structure */
-	vdev = g_new0(struct vfs_dev_t, 1);
-	fp_dev_set_instance_data(dev, vdev);
-
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
 
-	udev = fpi_dev_get_usb_dev(dev);
-	usb_operation(libusb_reset_device(udev), idev);
-	usb_operation(libusb_get_configuration(udev, &usb_config), idev);
+	udev = fpi_device_get_usb_device(dev);
 
-	if (usb_config != 1)
-		usb_operation(libusb_set_configuration(udev, 1), idev);
+	if (!usb_operation(g_usb_device_reset(udev, &error), dev, error))
+		return;
 
-	usb_operation(libusb_claim_interface(udev, 0), idev);
+	usb_config = g_usb_device_get_configuration(udev, &error);
+	if (!usb_operation(error == NULL, dev, error))
+		return;
+
+	if (usb_config != 1) {
+		if (!usb_operation(g_usb_device_set_configuration(udev, 1, &error), dev, error))
+			return;
+	}
+
+	if (!usb_operation(g_usb_device_claim_interface(udev, 0, 0, &error), dev, error))
+		return;
 
 	/* Clearing previous device state */
-	ssm = fpi_ssm_new(dev, init_ssm, INIT_STATE_LAST, g_new0(struct vfs_init_t, 1));
+	ssm = fpi_ssm_new(dev, init_ssm, INIT_STATE_LAST);
+	fpi_ssm_set_data(ssm, g_new0(struct vfs_init_t, 1), NULL);
 	fpi_ssm_start(ssm, dev_open_callback);
-
-	return 0;
 }
 
-static void led_blink_callback_with_ssm(struct fp_img_dev *idev, int status, void *data)
+static void led_blink_callback_with_ssm(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct fpi_ssm *ssm = data;
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpiSsm *ssm = data;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
-		vdev->timeout =
-			fpi_timeout_add(200, timeout_fpi_ssm_next_state,
-					FP_DEV(idev), ssm);
+	if (!error) {
+		fpi_ssm_next_state_delayed(ssm, 200, NULL);
 	} else {
 		/* NO need to fail here, it's not a big issue... */
-		fp_err("LED blinking failed with error %d", status);
+		fp_err("LED blinking failed with error %s", error->message);
 		fpi_ssm_next_state(ssm);
 	}
 }
 
 struct image_download_t {
-	struct fpi_ssm *parent_ssm;
+	FpiSsm *parent_ssm;
 
-	unsigned char image[144 * 144];
+	unsigned char image[VFS_IMAGE_SIZE * VFS_IMAGE_SIZE];
 	int image_size;
 };
 
-static void finger_image_download_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void finger_image_download_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct image_download_t *imgdown = data;
+	struct image_download_t *imgdown = fpi_ssm_get_data(ssm);
 
 	if (!fpi_ssm_get_error(ssm)) {
 		fpi_ssm_mark_completed(imgdown->parent_ssm);
 	} else {
 		fp_err("Scan failed failed at state %d, unexpected"
 		       "device reply during image download", fpi_ssm_get_cur_state(ssm));
-		fpi_imgdev_session_error(idev, fpi_ssm_get_error(ssm));
-		fpi_ssm_mark_failed(imgdown->parent_ssm, fpi_ssm_get_error(ssm));
+		fpi_ssm_mark_failed(imgdown->parent_ssm, error);
 	}
 
 	g_free(imgdown);
-	fpi_ssm_free(ssm);
 }
 
-static void finger_image_submit(struct fp_img_dev *idev, struct image_download_t *imgdown)
+static void finger_image_submit(FpImageDevice *idev,
+				struct image_download_t *imgdown)
 {
-	struct fp_img *img;
+	FpImage *img;
 
-	img = fpi_img_new(VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
-	img->flags = FP_IMG_H_FLIPPED;
-	img->width = VFS_IMAGE_SIZE;
-	img->height = VFS_IMAGE_SIZE;
+	img = fp_image_new(VFS_IMAGE_SIZE, VFS_IMAGE_SIZE);
+	img->flags = FPI_IMAGE_H_FLIPPED;
 	memcpy(img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 
 	if (VFS_IMAGE_RESCALE > 1) {
-		struct fp_img *resized;
+		FpImage *resized;
 
-		resized = fpi_img_resize(img, VFS_IMAGE_RESCALE, VFS_IMAGE_RESCALE);
-		fp_img_free(img);
-
-		img = resized;
+		resized = fpi_image_resize(img, VFS_IMAGE_RESCALE, VFS_IMAGE_RESCALE);
+		g_set_object(&img, resized);
 	}
 
-	fpi_imgdev_image_captured(idev, img);
+	fpi_image_device_image_captured(idev, img);
 }
 
-static void finger_image_download_read_callback(struct fp_img_dev *idev, int status, void *data)
+static void finger_image_download_read_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *ssm = data;
-	struct image_download_t *imgdown = fpi_ssm_get_user_data(ssm);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm = data;
+	struct image_download_t *imgdown = fpi_ssm_get_data(ssm);
 	int offset = (fpi_ssm_get_cur_state(ssm) == IMAGE_DOWNLOAD_STATE_1) ? 0x12 : 0x06;
 	int data_size = vdev->buffer_length - offset;
 
-	if (status != LIBUSB_TRANSFER_COMPLETED) {
+	if (error) {
 		fp_err("Image download failed at state %d", fpi_ssm_get_cur_state(ssm));
-		if (status != LIBUSB_TRANSFER_CANCELLED)
-			fpi_imgdev_session_error(idev, -EIO);
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			fpi_device_action_error(FP_DEVICE(idev), error);
 
-		fpi_ssm_mark_failed(ssm, status);
+		fpi_ssm_mark_failed(ssm, error);
 		return;
 	}
 
@@ -1516,11 +1519,12 @@ static void finger_image_download_read_callback(struct fp_img_dev *idev, int sta
 	fpi_ssm_next_state(ssm);
 }
 
-static void finger_image_download_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void finger_image_download_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct image_download_t *imgdown = data;
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	struct image_download_t *imgdown = fpi_ssm_get_data(ssm);
+	GError *error = NULL;
 
 	const unsigned char read_buffer_request[] = {
 		0x51, 0x00, 0x20, 0x00, 0x00
@@ -1544,13 +1548,19 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, v
 	case IMAGE_DOWNLOAD_STATE_SUBMIT:
 		finger_image_submit(idev, imgdown);
 
-		if ((fpi_imgdev_get_action(idev) == IMG_ACTION_VERIFY ||
-		     fpi_imgdev_get_action(idev) == IMG_ACTION_IDENTIFY) &&
-		    fpi_imgdev_get_action_result(idev) != FP_VERIFY_MATCH) {
-			fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
-		} else {
-			fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK);
-		}
+		/* FIXME: we can't get the state of the previous operation
+		 * with the new API, so let's just skip the red or green
+		 * blinking */
+
+		fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT);
+// FIXME
+		// if ((fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_VERIFY ||
+		//      fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_IDENTIFY) &&
+		//     fpi_device_get_current_action((idev) != FP_VERIFY_MATCH) {
+		// 	fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
+		// } else {
+		// 	fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK);
+		// }
 
 		break;
 
@@ -1577,69 +1587,69 @@ static void finger_image_download_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, v
 		break;
 
 	case IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT:
-		if (fpi_imgdev_get_action(idev) == IMG_ACTION_ENROLL &&
-		    fpi_imgdev_get_action_result(idev) != FP_ENROLL_COMPLETE) {
-			start_reactivate_subsm(idev, ssm);
+	//FIXME
+		fpi_image_device_report_finger_status(idev, FALSE);
+
+		if (fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_ENROLL) {
+			start_reactivate_subsm(dev, ssm);
 		} else {
 			fpi_ssm_mark_completed(ssm);
 		}
-
-		fpi_imgdev_report_finger_status(idev, FALSE);
 		break;
 
 	default:
-		fp_err("Unknown image download state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown image download state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void start_finger_image_download_subsm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm)
+static void start_finger_image_download_subsm(FpImageDevice *idev,
+					      FpiSsm *parent_ssm)
 {
-	struct fpi_ssm *ssm;
+	FpiSsm *ssm;
 	struct image_download_t *imgdown;
 
 	imgdown = g_new0(struct image_download_t, 1);
 	imgdown->parent_ssm = parent_ssm;
 
-	ssm = fpi_ssm_new(FP_DEV(idev),
+	ssm = fpi_ssm_new(FP_DEVICE(idev),
 			  finger_image_download_ssm,
-			  IMAGE_DOWNLOAD_STATE_LAST,
-			  imgdown);
+			  IMAGE_DOWNLOAD_STATE_LAST);
 
+	fpi_ssm_set_data(ssm, imgdown, NULL);
 	fpi_ssm_start(ssm, finger_image_download_callback);
 }
 
 struct scan_error_handler_data_t {
-	int error_code;
-	struct fpi_ssm *parent_ssm;
+	FpDeviceRetry retry;
+	FpiSsm *parent_ssm;
 };
 
-static void scan_error_handler_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void scan_error_handler_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-	struct scan_error_handler_data_t *error_data = data;
+	struct scan_error_handler_data_t *error_data = fpi_ssm_get_data (ssm);
 
 	if (fpi_ssm_get_error(ssm)) {
 		fp_err("Scan failed failed at state %d, unexpected "
 		       "device reply during scan error handling",
 		       fpi_ssm_get_cur_state(ssm));
-
-		fpi_ssm_mark_failed(error_data->parent_ssm,
-				    error_data->error_code);
 	} else {
+		fpi_image_device_retry_scan(FP_IMAGE_DEVICE(dev),
+					    error_data->retry);
 		fpi_ssm_jump_to_state(error_data->parent_ssm,
 				      SCAN_STATE_WAITING_FOR_FINGER);
 	}
 
 	g_free(error_data);
-	fpi_ssm_free(ssm);
 }
 
-static void scan_error_handler_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void scan_error_handler_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct scan_error_handler_data_t *error_data = data;
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	GError *error = NULL;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case SCAN_ERROR_STATE_LED_BLINK:
@@ -1650,89 +1660,91 @@ static void scan_error_handler_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void
 		break;
 
 	case SCAN_ERROR_STATE_REACTIVATE_REQUEST:
-		start_reactivate_subsm(idev, ssm);
+		start_reactivate_subsm(dev, ssm);
 
 		if (fpi_ssm_get_error(ssm))
-			fpi_imgdev_abort_scan(idev, error_data->error_code);
+			fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
 
-		fpi_imgdev_report_finger_status(idev, FALSE);
+		fpi_image_device_report_finger_status(idev, FALSE);
 		break;
 
 	default:
-		fp_err("Unknown scan state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown scan state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void start_scan_error_handler_ssm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm, int error_code)
+static void start_scan_error_handler_ssm(FpImageDevice *idev,
+					 FpiSsm *parent_ssm,
+					 FpDeviceRetry retry)
 {
 	struct scan_error_handler_data_t *error_data;
-	struct fpi_ssm *ssm;
+	FpiSsm *ssm;
 
 	error_data = g_new0(struct scan_error_handler_data_t, 1);
-	error_data->error_code = error_code;
+	error_data->retry = retry;
 	error_data->parent_ssm = parent_ssm;
 
-	ssm = fpi_ssm_new(FP_DEV(idev), scan_error_handler_ssm,
-			  SCAN_ERROR_STATE_LAST, error_data);
+	ssm = fpi_ssm_new(FP_DEVICE(idev), scan_error_handler_ssm,
+			  SCAN_ERROR_STATE_LAST);
+	fpi_ssm_set_data(ssm, error_data, NULL);
 	fpi_ssm_start(ssm, scan_error_handler_callback);
 }
 
-static void finger_scan_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void finger_scan_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	if (fpi_ssm_get_error(ssm)) {
 		fp_err("Scan failed failed at state %d, unexpected "
 		       "device reply during finger scanning", fpi_ssm_get_cur_state(ssm));
 
 		if (fpi_ssm_get_cur_state(ssm) > SCAN_STATE_FINGER_ON_SENSOR) {
-			fpi_imgdev_abort_scan(idev, fpi_ssm_get_error(ssm));
-			fpi_imgdev_report_finger_status(idev, FALSE);
+			fpi_image_device_session_error(idev, error);
+			fpi_image_device_report_finger_status(idev, FALSE);
 		} else {
-			fpi_imgdev_session_error(idev, fpi_ssm_get_error(ssm));
+			fpi_image_device_session_error(idev, error);
 		}
 	}
 
 	vdev->buffer_length = 0;
 	g_clear_pointer(&vdev->buffer, g_free);
-
-	fpi_ssm_free(ssm);
 }
 
-static void finger_scan_interrupt_callback(struct fp_img_dev *idev, int status, void *data)
+static void finger_scan_interrupt_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *ssm = data;
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm = data;
 	int interrupt_type;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
+	if (!error) {
 		interrupt_type = translate_interrupt(vdev->buffer,
 						     vdev->buffer_length);
 		fpi_ssm_jump_to_state(ssm, interrupt_type);
-	} else if (status == LIBUSB_TRANSFER_CANCELLED) {
+	} else if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 		fpi_ssm_mark_completed(ssm);
 	} else {
-		fpi_ssm_mark_failed(ssm, usb_error_to_fprint_fail(idev, status));
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void finger_scan_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void finger_scan_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	int error_code;
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	GError *error = NULL;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case SCAN_STATE_FINGER_ON_SENSOR:
-		fpi_imgdev_report_finger_status(idev, TRUE);
+		fpi_image_device_report_finger_status(idev, TRUE);
 
 	case SCAN_STATE_WAITING_FOR_FINGER:
 	case SCAN_STATE_IN_PROGRESS:
 	case SCAN_STATE_COMPLETED:
-		async_read_from_usb(idev, VFS_READ_INTERRUPT,
+		async_read_from_usb(idev, FP_TRANSFER_INTERRUPT,
 				    vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
 				    finger_scan_interrupt_callback, ssm);
 
@@ -1740,29 +1752,13 @@ static void finger_scan_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 
 	case SCAN_STATE_FAILED_TOO_SHORT:
 	case SCAN_STATE_FAILED_TOO_FAST:
-		switch (fpi_imgdev_get_action(idev)) {
-		case IMG_ACTION_ENROLL:
-			error_code = FP_ENROLL_RETRY_TOO_SHORT;
-			break;
-		case IMG_ACTION_VERIFY:
-		case IMG_ACTION_IDENTIFY:
-			error_code = FP_VERIFY_RETRY_TOO_SHORT;
-			break;
-		case IMG_ACTION_CAPTURE:
-			error_code = FP_CAPTURE_FAIL;
-			break;
-		default:
-			error_code = -1;
-		}
-
-		start_scan_error_handler_ssm(idev, ssm, error_code);
+		start_scan_error_handler_ssm(idev, ssm, FP_DEVICE_RETRY_TOO_SHORT);
 		break;
 
 	case SCAN_STATE_SUCCESS_LOW_QUALITY:
-		if (fpi_imgdev_get_action(idev) == IMG_ACTION_ENROLL) {
-			error_code = FP_ENROLL_RETRY_CENTER_FINGER;
-			start_scan_error_handler_ssm(idev, ssm, error_code);
-		} else if (fpi_imgdev_get_action(idev) == IMG_ACTION_VERIFY) {
+		if (fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_ENROLL) {
+			start_scan_error_handler_ssm(idev, ssm, FP_DEVICE_RETRY_CENTER_FINGER);
+		} else if (fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_VERIFY) {
 			fp_warn("Low quality image in verification, might fail");
 			fpi_ssm_jump_to_state(ssm, SCAN_STATE_SUCCESS);
 		}
@@ -1773,68 +1769,71 @@ static void finger_scan_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		break;
 
 	default:
-		fp_err("Unknown scan state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown scan state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void start_finger_scan(struct fp_img_dev *idev)
+static void start_finger_scan(FpImageDevice *idev)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *ssm;
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm;
 
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
 
-	ssm = fpi_ssm_new(FP_DEV(idev), finger_scan_ssm, SCAN_STATE_LAST, NULL);
+	ssm = fpi_ssm_new(FP_DEVICE(idev), finger_scan_ssm, SCAN_STATE_LAST);
 	fpi_ssm_start(ssm, finger_scan_callback);
 }
 
-static void send_activate_sequence(struct fp_img_dev *idev, struct fpi_ssm *ssm, int sequence)
+static void send_activate_sequence(FpImageDevice *idev, FpiSsm *ssm,
+				   int sequence)
 {
 	do_data_exchange(idev, ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
-static void activate_device_interrupt_callback(struct fp_img_dev *idev, int status, void *data)
+static void activate_device_interrupt_callback(FpImageDevice *idev, gpointer data, GError *error)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *ssm = data;
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm = data;
 	int interrupt_type;
 
-	if (status == LIBUSB_TRANSFER_COMPLETED) {
+	if (!error) {
 		interrupt_type = translate_interrupt(vdev->buffer,
 						     vdev->buffer_length);
 
 		if (interrupt_type == VFS_SCAN_WAITING_FOR_FINGER) {
-			struct fp_dev *dev = FP_DEV(idev);
-			if (fpi_imgdev_get_action(idev) == IMG_ACTION_ENROLL &&
-			    dev->state == DEV_STATE_ENROLLING) {
-				struct fpi_ssm *child_ssm;
+			FpDevice *dev = FP_DEVICE(idev);
+			if (fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_ENROLL) {
+				FpiSsm *child_ssm;
 				child_ssm = fpi_ssm_new(dev,
 							finger_scan_ssm,
-							SCAN_STATE_LAST,
-							NULL);
+							SCAN_STATE_LAST);
 				fpi_ssm_start_subsm(ssm, child_ssm);
 			} else {
 				fpi_ssm_next_state(ssm);
 			}
 		} else {
-			fp_err("Unexpected device interrupt (%d) at this state",
-			       interrupt_type);
+			error = fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_INVALID,
+							 "Unexpected device interrupt "
+							 "(%d) at this state",
+							 interrupt_type);
+			fp_err("%s", error->message);
 			print_hex(vdev->buffer, vdev->buffer_length);
-			fpi_ssm_mark_failed(ssm,
-					    usb_error_to_fprint_fail(idev, -EIO));
+			fpi_ssm_mark_failed(ssm, error);
 		}
 	} else {
-		fpi_ssm_mark_failed(ssm, usb_error_to_fprint_fail(idev, status));
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void activate_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void activate_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	GError *error = NULL;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case ACTIVATE_STATE_GREEN_LED_ON:
@@ -1856,100 +1855,74 @@ static void activate_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 
 	case ACTIVATE_STATE_WAIT_DEVICE:
 		if (check_data_exchange(vdev, &MATRIX_ALREADY_ACTIVATED_DEX)) {
-			fp_info("Waiting for device not needed, already active\n");
+			fp_info("Waiting for device not needed, already active");
 			fpi_ssm_next_state(ssm);
 			break;
 		}
 
-		async_read_from_usb(idev, VFS_READ_INTERRUPT,
+		async_read_from_usb(idev, FP_TRANSFER_INTERRUPT,
 				    vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
 				    activate_device_interrupt_callback, ssm);
 		break;
 
 	default:
-		fp_err("Unknown state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown activation state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
 /* Callback for dev_activate ssm */
-static void dev_activate_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void dev_activate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	if (fpi_ssm_get_error(ssm)) {
 		fp_err("Activation failed failed at state %d, unexpected "
 		       "device reply during activation", fpi_ssm_get_cur_state(ssm));
-		fpi_imgdev_session_error(idev, fpi_ssm_get_error(ssm));
+		fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
 	}
 
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	fpi_imgdev_activate_complete(idev, fpi_ssm_get_error(ssm));
+	fpi_image_device_activate_complete(idev, fpi_ssm_get_error(ssm));
 
 	if (!fpi_ssm_get_error(ssm))
 		start_finger_scan(idev);
-
-	fpi_ssm_free(ssm);
 }
 
-static int dev_activate(struct fp_img_dev *idev)
+static void dev_activate(FpImageDevice *idev)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *ssm;
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm;
 
 	// SEE IF CAN BE DONE ONLY ON CERTAIN CASES
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
 
-	ssm = fpi_ssm_new(FP_DEV(idev), activate_ssm, ACTIVATE_STATE_LAST, NULL);
+	ssm = fpi_ssm_new(FP_DEVICE(idev), activate_ssm, ACTIVATE_STATE_LAST);
 	fpi_ssm_start(ssm, dev_activate_callback);
-
-	return 0;
 }
 
-static int dev_change_state(struct fp_img_dev *idev, enum fp_imgdev_state state)
-{
-	switch(state) {
-		case IMGDEV_STATE_INACTIVE:
-			printf("State change: IMGDEV_STATE_INACTIVE\n");
-			break;
-		case IMGDEV_STATE_AWAIT_FINGER_ON:
-			printf("State change: IMGDEV_STATE_AWAIT_FINGER_ON\n");
-			break;
-		case IMGDEV_STATE_CAPTURE:
-			printf("State change: IMGDEV_STATE_CAPTURE\n");
-			break;
-		case IMGDEV_STATE_AWAIT_FINGER_OFF:
-			printf("State change: IMGDEV_STATE_AWAIT_FINGER_OFF\n");
-			break;
-	}
-
-	return 0;
-}
-
-static void send_deactivate_sequence(struct fp_img_dev *idev, struct fpi_ssm *ssm, int sequence)
+static void send_deactivate_sequence(FpImageDevice *idev, FpiSsm *ssm,
+				     int sequence)
 {
 	do_data_exchange(idev, ssm, &DEACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
 }
 
-static void deactivate_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void deactivate_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	GError *error = NULL;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case DEACTIVATE_STOP_TRANSFER:
-		g_clear_pointer(&vdev->timeout, fpi_timeout_cancel);
-
-		if (vdev->transfer) {
-			/* Ignoring further callbacks, not ideal but safer */
-			vdev->transfer->callback = NULL;
-			g_clear_pointer(&vdev->transfer, libusb_cancel_transfer);
-		}
+		g_cancellable_cancel(vdev->cancellable);
+		g_clear_object(&vdev->cancellable);
 
 		fpi_ssm_next_state(ssm);
 		break;
@@ -1967,88 +1940,93 @@ static void deactivate_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
 		break;
 
 	default:
-		fp_err("Unknown state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown deactivate state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 }
 
-static void dev_deactivate_callback(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void dev_deactivate_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
+	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
 
 	if (fpi_ssm_get_error(ssm)) {
 		fp_err("Deactivation failed failed at state %d, unexpected "
 		       "device reply during deactivation", fpi_ssm_get_cur_state(ssm));
-		fpi_imgdev_session_error(idev, fpi_ssm_get_error(ssm));
+		fpi_image_device_session_error(idev, fpi_ssm_get_error(ssm));
 	}
 
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	fpi_imgdev_deactivate_complete(idev);
+	g_cancellable_cancel(vdev->cancellable);
+	g_clear_object(&vdev->cancellable);
 
-	fpi_ssm_free(ssm);
+	fpi_image_device_deactivate_complete(idev, NULL);
 }
 
-static void dev_deactivate(struct fp_img_dev *idev)
+static void dev_deactivate(FpImageDevice *idev)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *ssm;
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm;
 
-	g_clear_pointer(&vdev->timeout, fpi_timeout_cancel);
 	g_clear_pointer(&vdev->buffer, g_free);
 
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
 
-	ssm = fpi_ssm_new(FP_DEV(idev), deactivate_ssm, DEACTIVATE_STATE_LAST, NULL);
+	ssm = fpi_ssm_new(FP_DEVICE(idev), deactivate_ssm,
+			  DEACTIVATE_STATE_LAST);
 	fpi_ssm_start(ssm, dev_deactivate_callback);
 }
 
-static void reactivate_ssm(struct fpi_ssm *ssm, struct fp_dev *dev, void *data)
+static void reactivate_ssm(FpiSsm *ssm, FpDevice *dev)
 {
-	struct fp_img_dev *idev = FP_IMG_DEV(dev);
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	struct fpi_ssm *child_ssm = NULL;
+	FpiSsm *child_ssm = NULL;
+	GError *error = NULL;
 
 	switch (fpi_ssm_get_cur_state(ssm)) {
 	case REACTIVATE_STATE_WAIT:
-		g_clear_pointer(&vdev->timeout, fpi_timeout_cancel);
-		vdev->timeout =
-			fpi_timeout_add(100, timeout_fpi_ssm_next_state, dev, ssm);
+		fpi_ssm_next_state_delayed(ssm, 100, NULL);
 		break;
 	case REACTIVATE_STATE_DEACTIVATE:
-		child_ssm = fpi_ssm_new(FP_DEV(idev), deactivate_ssm, DEACTIVATE_STATE_LAST, NULL);
+		child_ssm = fpi_ssm_new(dev, deactivate_ssm,
+				        DEACTIVATE_STATE_LAST);
 		break;
 	case REACTIVATE_STATE_ACTIVATE:
-		child_ssm = fpi_ssm_new(FP_DEV(idev), activate_ssm, ACTIVATE_STATE_LAST, NULL);
+		child_ssm = fpi_ssm_new(dev, activate_ssm,
+				        ACTIVATE_STATE_LAST);
 		break;
 	default:
-		fp_err("Unknown reactivate state");
-		fpi_imgdev_session_error(idev, -EIO);
-		fpi_ssm_mark_failed(ssm, -EIO);
+		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
+						 "Unknown reactivate state");
+		fp_err("%s", error->message);
+		fpi_ssm_mark_failed(ssm, error);
 	}
 
 	if (child_ssm)
 		fpi_ssm_start_subsm(ssm, child_ssm);
 }
 
-static void start_reactivate_subsm(struct fp_img_dev *idev, struct fpi_ssm *parent_ssm)
+static void start_reactivate_subsm(FpDevice *dev,
+				   FpiSsm *parent_ssm)
 {
-	struct fpi_ssm *ssm;
+	FpiSsm *ssm;
 
-	ssm = fpi_ssm_new(FP_DEV(idev), reactivate_ssm, REACTIVATE_STATE_LAST, NULL);
+	ssm = fpi_ssm_new(dev, reactivate_ssm,
+			  REACTIVATE_STATE_LAST);
 	fpi_ssm_start_subsm(parent_ssm, ssm);
 }
 
-static void dev_close(struct fp_img_dev *idev)
+static void dev_close(FpImageDevice *idev)
 {
-	struct vfs_dev_t *vdev = VFS_DEV_FROM_IMG(idev);
-	libusb_device_handle *udev = fpi_dev_get_usb_dev(FP_DEV(idev));
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	GUsbDevice *udev = fpi_device_get_usb_device(FP_DEVICE(idev));
+	GError *error = NULL;
 
-	usb_operation(libusb_release_interface(udev, 0), NULL);
+	usb_operation(g_usb_device_release_interface(udev, 0, 0, &error), NULL, error);
 
 	NSS_Shutdown();
 	ERR_free_strings();
@@ -2057,37 +2035,37 @@ static void dev_close(struct fp_img_dev *idev)
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	g_free(vdev);
-	fpi_imgdev_close_complete(idev);
+	fpi_image_device_close_complete(idev, error);
 }
 
 /* Usb id table of device */
-static const struct usb_id id_table[] = {
-	{ .vendor = 0x138a, .product = 0x0090 },
-	{ 0, 0, 0, },
+static const FpIdEntry id_table [] = {
+	{ .vid = 0x138a, .pid = 0x0090 },
+	{ .vid = 0,  .pid = 0, .driver_data = 0 },
 };
 
-/* Device driver definition */
-struct fp_img_driver vfs0090_driver = {
-	/* Driver specification */
-	.driver = {
-		.id = VFS0090_ID,
-		.name = FP_COMPONENT,
-		.full_name = "Validity VFS0090",
-		.id_table = id_table,
-		.scan_type = FP_SCAN_TYPE_PRESS,
-	},
+static void fpi_device_vfs0090_init(FpiDeviceVfs0090 *self)
+{
+}
 
-	/* Image specification */
-	.flags = 0,
-	.img_width = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE,
-	.img_height = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE,
-	.bz3_threshold = 12,
+static void fpi_device_vfs0090_class_init(FpiDeviceVfs0090Class *klass)
+{
+	FpDeviceClass *dev_class = FP_DEVICE_CLASS(klass);
+	FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS(klass);
 
-	/* Routine specification */
-	.open = dev_open,
-	.close = dev_close,
-	.activate = dev_activate,
-	.change_state = dev_change_state,
-	.deactivate = dev_deactivate,
-};
+	dev_class->id = "vfs0090";
+	dev_class->full_name = "Validity VFS0090";
+	dev_class->type = FP_DEVICE_TYPE_USB;
+	dev_class->id_table = id_table;
+	dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+
+	img_class->img_open = dev_open;
+	img_class->img_close = dev_close;
+	img_class->activate = dev_activate;
+	img_class->deactivate = dev_deactivate;
+
+	img_class->bz3_threshold = 12;
+
+	img_class->img_width = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE;
+	img_class->img_height = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE;
+}

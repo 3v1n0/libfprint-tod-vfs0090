@@ -1,7 +1,7 @@
 /*
  * Validity VFS0090 driver for libfprint
  * Copyright (C) 2017 Nikita Mikhailov <nikita.s.mikhailov@gmail.com>
- * Copyright (C) 2018 Marco Trevisan <marco@ubuntu.com>
+ * Copyright (C) 2018-2019 Marco Trevisan <marco@ubuntu.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -18,14 +18,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <glib.h>
+#pragma once
+
+#include "fpi-image-device.h"
+
+G_DECLARE_FINAL_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FPI, DEVICE_VFS0090, FpImageDevice)
 
 #define DMI_PRODUCT_NAME_NODE "/sys/class/dmi/id/product_name"
 #define DMI_PRODUCT_SERIAL_NODE "/sys/class/dmi/id/product_serial"
 
 #define VFS_USB_TIMEOUT 3000
 #define VFS_USB_INTERRUPT_TIMEOUT 0
-#define VFS_USB_BUFFER_SIZE 15 * 1024
+#define VFS_USB_BUFFER_SIZE 30 * 1024
 #define VFS_USB_INTERRUPT_BUFFER_SIZE 0x100
 
 #define VFS_MASTER_KEY_SIZE 0x20
@@ -140,11 +144,6 @@ enum REACTIVATE_STATES {
 	REACTIVATE_STATE_ACTIVATE,
 
 	REACTIVATE_STATE_LAST
-};
-
-enum VFS_READ_MODE {
-	VFS_READ_BULK,
-	VFS_READ_INTERRUPT,
 };
 
 enum DATA_EXCHANGE_MODE {
@@ -691,7 +690,7 @@ static const struct data_exchange_t DEACTIVATE_SEQUENCES[] = {
 		.msg = (unsigned char []) { 0x60, 0x00, 0x00, 0x00, 0x00 },
 		.msg_length = 5,
 		.rsp = (unsigned char []) { 0xf5, 0x04 },
-		.rsp_length = 2,
+		.rsp_length = -1, /* 2 or 69 */
 	},
 	{
 		.msg = (unsigned char []) { 0x62, 0x00, 0x00, 0x00, 0x00 },

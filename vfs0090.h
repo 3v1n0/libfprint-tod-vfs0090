@@ -56,6 +56,9 @@ enum INIT_STATES {
 	INIT_STATE_LAST
 };
 
+/* This is the init state in which we check whether the chip is initialized */
+#define PROBE_STATE_LAST INIT_STATE_SEQ_2 + 1
+
 enum TLS_HANDSHAKE_STATES {
 	TLS_HANDSHAKE_STATE_CLIENT_HELLO,
 	TLS_HANDSHAKE_STATE_SERVER_HELLO_RCV,

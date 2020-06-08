@@ -491,13 +491,14 @@ out_serial:
 	fclose(name_file);
 }
 
-#define usb_operation(func, dev, error) usb_operation_perform(STRINGIZE(func), func, dev, error)
-static gboolean usb_operation_perform(const char *op, gboolean ret, FpDevice *dev, GError *error)
+#define usb_operation(func, dev, error_ptr) usb_operation_perform(STRINGIZE(func), func, dev, error_ptr)
+static gboolean usb_operation_perform(const char *op, gboolean ret, FpDevice *dev, GError **error)
 {
-	if (!ret && error) {
-		fp_err("USB operation '%s' failed: %s", op, error->message);
-		if (dev) {
-			fpi_device_action_error(dev, error);
+	if (!ret) {
+		fp_err("USB operation '%s' failed: %s", op,
+		       (error && *error) ? (*error)->message : NULL);
+		if (dev && error) {
+			fpi_device_action_error(dev, *error);
 		}
 	}
 
@@ -1218,7 +1219,6 @@ static void send_init_sequence(FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 	do_data_exchange(vdev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
 }
 
-/* Main SSM loop */
 static void init_ssm(FpiSsm *ssm, FpDevice *dev)
 {
 	FpImageDevice *idev = FP_IMAGE_DEVICE(dev);
@@ -1345,26 +1345,40 @@ static void dev_open_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
 		fpi_image_device_open_complete(idev, error);
 }
 
-/* Open device */
-static void dev_open(FpImageDevice *idev)
+static gboolean vfs0090_init(FpiDeviceVfs0090 *vdev)
 {
-	FpDevice *dev = FP_DEVICE(idev);
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
-	FpiSsm *ssm;
+	FpDevice *dev = FP_DEVICE(vdev);
 	GUsbDevice *udev;
 	GError *error = NULL;
 	SECStatus secs_status;
 	int usb_config;
 
-	fp_dbg("Opening device");
+	fp_dbg("Initializing device");
+
+	udev = fpi_device_get_usb_device(dev);
+
+	if (!usb_operation(g_usb_device_reset(udev, &error), dev, &error))
+		return FALSE;
+
+	usb_config = g_usb_device_get_configuration(udev, &error);
+	if (!usb_operation(error == NULL, dev, &error))
+		return FALSE;
+
+	if (usb_config != 1) {
+		if (!usb_operation(g_usb_device_set_configuration(udev, 1, &error), dev, &error))
+			return FALSE;
+	}
+
+	if (!usb_operation(g_usb_device_claim_interface(udev, 0, 0, &error), dev, &error))
+		return FALSE;
 
 	secs_status = NSS_NoDB_Init(NULL);
 	if (secs_status != SECSuccess) {
 		error = fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL,
 						 "could not initialise NSS");
 		fp_err("%s", error->message);
-		fpi_image_device_open_complete(idev, error);
-		return;
+		fpi_device_action_error(dev, error);
+		return FALSE;
 	}
 
 	OpenSSL_add_all_algorithms();
@@ -1374,25 +1388,20 @@ static void dev_open(FpImageDevice *idev)
 	vdev->buffer = g_malloc(VFS_USB_BUFFER_SIZE);
 	vdev->buffer_length = 0;
 
-	udev = fpi_device_get_usb_device(dev);
+	return TRUE;
+}
 
-	if (!usb_operation(g_usb_device_reset(udev, &error), dev, error))
-		return;
+/* Open device */
+static void dev_open(FpImageDevice *idev)
+{
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	FpiSsm *ssm;
 
-	usb_config = g_usb_device_get_configuration(udev, &error);
-	if (!usb_operation(error == NULL, dev, error))
-		return;
-
-	if (usb_config != 1) {
-		if (!usb_operation(g_usb_device_set_configuration(udev, 1, &error), dev, error))
-			return;
-	}
-
-	if (!usb_operation(g_usb_device_claim_interface(udev, 0, 0, &error), dev, error))
+	if (!vfs0090_init(vdev))
 		return;
 
 	/* Clearing previous device state */
-	ssm = fpi_ssm_new(dev, init_ssm, INIT_STATE_LAST);
+	ssm = fpi_ssm_new(FP_DEVICE(idev), init_ssm, INIT_STATE_LAST);
 	fpi_ssm_set_data(ssm, g_new0(struct vfs_init_t, 1), (GDestroyNotify) vfs_init_free);
 	fpi_ssm_start(ssm, dev_open_callback);
 }
@@ -1946,13 +1955,9 @@ static void start_reactivate_ssm(FpDevice *dev)
 	fpi_ssm_start(ssm, reactivate_ssm_callback);
 }
 
-static void dev_close(FpImageDevice *idev)
+static gboolean vfs0090_deinit(FpiDeviceVfs0090 *vdev, GError **error)
 {
-	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
-	GUsbDevice *udev = fpi_device_get_usb_device(FP_DEVICE(idev));
-	GError *error = NULL;
-
-	usb_operation(g_usb_device_release_interface(udev, 0, 0, &error), NULL, error);
+	GUsbDevice *udev = fpi_device_get_usb_device(FP_DEVICE(vdev));
 
 	NSS_Shutdown();
 	ERR_free_strings();
@@ -1961,7 +1966,64 @@ static void dev_close(FpImageDevice *idev)
 	g_clear_pointer(&vdev->buffer, g_free);
 	vdev->buffer_length = 0;
 
-	fpi_image_device_close_complete(idev, error);
+	return g_usb_device_release_interface(udev, 0, 0, error);
+}
+
+static void dev_close(FpImageDevice *idev)
+{
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(idev);
+	GError *error = NULL;
+
+	if (vfs0090_deinit(vdev, &error))
+		fpi_image_device_close_complete(idev, error);
+}
+
+static void dev_probe_callback(FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
+	GUsbDevice *usb_dev;
+
+	usb_dev = fpi_device_get_usb_device (dev);
+
+	if (error) {
+		fpi_device_probe_complete(dev, NULL, NULL, error);
+		g_usb_device_close (usb_dev, NULL);
+		vfs0090_deinit(vdev, NULL);
+		return;
+	}
+
+	if (!vfs0090_deinit(vdev, &error)) {
+		usb_operation(g_usb_device_close (usb_dev, &error), dev, &error);
+		return;
+	}
+
+	if (!usb_operation(g_usb_device_close (usb_dev, &error), dev, &error))
+		return;
+
+	fpi_device_probe_complete(dev, NULL, NULL, error);
+}
+
+static void dev_probe(FpDevice *dev)
+{
+	FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090(dev);
+	g_autofree gchar *serial = NULL;
+	GError *error = NULL;
+	GUsbDevice *usb_dev;
+	FpiSsm *ssm;
+
+	usb_dev = fpi_device_get_usb_device (dev);
+	if (!usb_operation(g_usb_device_open (usb_dev, &error), dev, &error)) {
+		return;
+	}
+
+	if (!vfs0090_init(vdev)) {
+		usb_operation(g_usb_device_close (usb_dev, &error), dev, &error);
+		return;
+	}
+
+	ssm = fpi_ssm_new(dev, init_ssm, PROBE_STATE_LAST);
+	fpi_ssm_set_data(ssm, g_new0(struct vfs_init_t, 1), (GDestroyNotify) vfs_init_free);
+	fpi_ssm_start(ssm, dev_probe_callback);
 }
 
 static void
@@ -2016,6 +2078,7 @@ static void fpi_device_vfs0090_class_init(FpiDeviceVfs0090Class *klass)
 	dev_class->type = FP_DEVICE_TYPE_USB;
 	dev_class->id_table = id_table;
 	dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+	dev_class->probe = dev_probe;
 
 	img_class->img_open = dev_open;
 	img_class->img_close = dev_close;

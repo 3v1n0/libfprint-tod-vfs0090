@@ -55,6 +55,7 @@ struct _FpiDeviceVfs0090
   int            buffer_length;
 
   unsigned int   enroll_stage;
+  FpiMatchResult match_result;
   GError        *action_error;
   FpPrint       *enrolled_print;
   FpImage       *captured_image;
@@ -1600,12 +1601,32 @@ finger_image_download_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 }
 
 static void
+restart_scan_or_deactivate (FpiDeviceVfs0090 *vdev)
+{
+  FpDevice *dev = FP_DEVICE (vdev);
+
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
+      vdev->enroll_stage < fp_device_get_nr_enroll_stages (dev))
+    start_reactivate_ssm (dev);
+  else
+    dev_deactivate (dev);
+}
+
+typedef struct _VfsMinutiaeDetection
+{
+  FpDevice *dev;
+  FpiSsm   *download_ssm;
+} VfsMinutiaeDetection;
+
+static void
 minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
   g_autoptr(FpImage) image = FP_IMAGE (source_object);
   g_autoptr(FpPrint) print = NULL;
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (user_data);
-  FpDevice *dev = FP_DEVICE (vdev);
+  g_autofree VfsMinutiaeDetection *minutiae_data = user_data;
+  FpDevice *dev = minutiae_data->dev;
+  FpiSsm *download_ssm = minutiae_data->download_ssm;
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   GError *error = NULL;
   FpiDeviceAction action;
 
@@ -1614,8 +1635,7 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
       /* Cancel operation */
       if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
         {
-          vdev->action_error = g_steal_pointer (&error);
-          dev_deactivate (dev);
+          fpi_ssm_mark_failed (download_ssm, error);
           return;
         }
 
@@ -1627,6 +1647,7 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
                                         "Minutiae detection failed, please retry");
     }
 
+  vdev->match_result = FPI_MATCH_SUCCESS;
   action = fpi_device_get_current_action (dev);
 
   if (action == FPI_DEVICE_ACTION_CAPTURE)
@@ -1634,7 +1655,7 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
       vdev->action_error = g_steal_pointer (&error);
       vdev->captured_image = g_steal_pointer (&image);
 
-      dev_deactivate (dev);
+      fpi_ssm_jump_to_state (download_ssm, IMAGE_DOWNLOAD_STATE_CHECK_RESULT);
       return;
     }
 
@@ -1650,7 +1671,7 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
           if (error->domain != FP_DEVICE_RETRY)
             {
               vdev->action_error = g_steal_pointer (&error);
-              dev_deactivate (dev);
+              fpi_ssm_jump_to_state (download_ssm, IMAGE_DOWNLOAD_STATE_CHECK_RESULT);
               return;
             }
         }
@@ -1672,37 +1693,29 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
         fpi_device_enroll_progress (dev, vdev->enroll_stage,
                                     g_steal_pointer (&print), error);
 
-        /* Start another scan or deactivate. */
-        if (vdev->enroll_stage == fp_device_get_nr_enroll_stages (dev))
-          {
-            vdev->enrolled_print = g_object_ref (enroll_print);
-            dev_deactivate (dev);
-          }
-        else
-          {
-            start_reactivate_ssm (dev);
-          }
+        fpi_ssm_jump_to_state (download_ssm, IMAGE_DOWNLOAD_STATE_CHECK_RESULT);
         break;
       }
 
     case FPI_DEVICE_ACTION_VERIFY:
       {
         FpPrint *template;
-        FpiMatchResult result;
 
         fpi_device_get_verify_data (dev, &template);
         if (print)
-          result = fpi_print_bz3_match (template, print, VFS_BZ3_THRESHOLD, &error);
+          vdev->match_result = fpi_print_bz3_match (template, print,
+                                                    VFS_BZ3_THRESHOLD,
+                                                    &error);
         else
-          result = FPI_MATCH_ERROR;
+          vdev->match_result = FPI_MATCH_ERROR;
 
         if (!error || error->domain == FP_DEVICE_RETRY)
-          fpi_device_verify_report (dev, result, g_steal_pointer (&print),
+          fpi_device_verify_report (dev, vdev->match_result,
+                                    g_steal_pointer (&print),
                                     g_steal_pointer (&error));
 
         vdev->action_error = g_steal_pointer (&error);
-        /* Add led blinking! */
-        dev_deactivate (dev);
+        fpi_ssm_jump_to_state (download_ssm, IMAGE_DOWNLOAD_STATE_CHECK_RESULT);
         break;
       }
 
@@ -1729,7 +1742,8 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
                                       g_steal_pointer (&error));
 
         vdev->action_error = g_steal_pointer (&error);
-        dev_deactivate (dev);
+        vdev->match_result = result ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+        fpi_ssm_jump_to_state (download_ssm, IMAGE_DOWNLOAD_STATE_CHECK_RESULT);
         break;
       }
 
@@ -1740,9 +1754,11 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
 
 static void
 finger_image_submit (FpDevice         *dev,
-                     VfsImageDownload *imgdown)
+                     VfsImageDownload *imgdown,
+                     FpiSsm           *download_ssm)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  VfsMinutiaeDetection *minutiae_data;
   FpImage *img;
 
   img = fp_image_new (VFS_IMAGE_SIZE, VFS_IMAGE_SIZE);
@@ -1757,11 +1773,15 @@ finger_image_submit (FpDevice         *dev,
       g_set_object (&img, resized);
     }
 
+  minutiae_data = g_new0 (VfsMinutiaeDetection, 1);
+  minutiae_data->dev = dev;
+  minutiae_data->download_ssm = download_ssm;
+
   fp_dbg ("Detecting minutiae");
   fp_image_detect_minutiae (img,
                             vdev->cancellable,
                             minutiae_detected,
-                            dev);
+                            minutiae_data);
 }
 
 static void
@@ -1814,22 +1834,15 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
 
-    case IMAGE_DOWNLOAD_STATE_SUBMIT:
-      finger_image_submit (dev, imgdown);
+    case IMAGE_DOWNLOAD_STATE_SUBMIT_IMAGE:
+      finger_image_submit (dev, imgdown, ssm);
+      break;
 
-      /* FIXME: we can't get the state of the previous operation
-       * with the new API, so let's just skip the red or green
-       * blinking */
-
-      fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT);
-// FIXME
-      // if ((fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_VERIFY ||
-      //      fpi_device_get_current_action(FP_DEVICE(idev)) == FPI_DEVICE_ACTION_IDENTIFY) &&
-      //     fpi_device_get_current_action((idev) != FP_VERIFY_MATCH) {
-      //        fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
-      // } else {
-      //        fpi_ssm_jump_to_state(ssm, IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK);
-      // }
+    case IMAGE_DOWNLOAD_STATE_CHECK_RESULT:
+      if (vdev->action_error || vdev->match_result != FPI_MATCH_SUCCESS)
+        fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
+      else
+        fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK);
 
       break;
 
@@ -1856,6 +1869,7 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT:
+      restart_scan_or_deactivate (vdev);
       fpi_ssm_next_state (ssm);
       break;
 
@@ -1955,13 +1969,7 @@ scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
 
     case SCAN_ERROR_STATE_REACTIVATE_REQUEST:
       report_retry_error (dev, error_data->retry);
-
-      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
-          vdev->enroll_stage < fp_device_get_nr_enroll_stages (dev))
-        start_reactivate_ssm (dev);
-      else
-        dev_deactivate (dev);
-
+      restart_scan_or_deactivate (vdev);
       fpi_ssm_next_state (ssm);
       break;
 

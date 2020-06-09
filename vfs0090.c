@@ -1898,16 +1898,10 @@ start_finger_image_download_subsm (FpDevice *dev,
   fpi_ssm_start (ssm, finger_image_download_callback);
 }
 
-typedef struct _VfsScanErrorHandlerData
-{
-  FpDeviceRetry retry;
-  FpiSsm       *parent_ssm;
-} VfsScanErrorHandlerData;
-
 static void
 scan_error_handler_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  VfsScanErrorHandlerData *error_data = fpi_ssm_get_data (ssm);
+  FpiSsm *parent_ssm = fpi_ssm_get_data (ssm);
 
   if (error)
     {
@@ -1918,11 +1912,11 @@ scan_error_handler_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
                   fpi_ssm_get_cur_state (ssm));
         }
 
-      fpi_ssm_mark_failed (error_data->parent_ssm, error);
+      fpi_ssm_mark_failed (parent_ssm, error);
     }
   else
     {
-      fpi_ssm_mark_completed (error_data->parent_ssm);
+      fpi_ssm_mark_completed (parent_ssm);
     }
 }
 
@@ -1955,7 +1949,6 @@ static void
 scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
-  VfsScanErrorHandlerData *error_data = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -1968,7 +1961,6 @@ scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_ERROR_STATE_REACTIVATE_REQUEST:
-      report_retry_error (dev, error_data->retry);
       restart_scan_or_deactivate (vdev);
       fpi_ssm_next_state (ssm);
       break;
@@ -1985,16 +1977,13 @@ start_scan_error_handler_ssm (FpDevice     *dev,
                               FpiSsm       *parent_ssm,
                               FpDeviceRetry retry)
 {
-  VfsScanErrorHandlerData *error_data;
   FpiSsm *ssm;
 
-  error_data = g_new0 (VfsScanErrorHandlerData, 1);
-  error_data->retry = retry;
-  error_data->parent_ssm = parent_ssm;
+  report_retry_error (dev, retry);
 
   ssm = fpi_ssm_new (dev, scan_error_handler_ssm,
                      SCAN_ERROR_STATE_LAST);
-  fpi_ssm_set_data (ssm, error_data, g_free);
+  fpi_ssm_set_data (ssm, parent_ssm, NULL);
   fpi_ssm_start (ssm, scan_error_handler_callback);
 }
 

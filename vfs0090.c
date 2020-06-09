@@ -75,7 +75,7 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_PKEY, EVP_PKEY_free);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_PKEY_CTX, EVP_PKEY_CTX_free);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (BIGNUM, BN_free);
 
-struct vfs_init_t
+typedef struct _VfsInit
 {
   unsigned char *main_seed;
   unsigned int   main_seed_length;
@@ -83,10 +83,10 @@ struct vfs_init_t
   unsigned char  ecdsa_private_key[VFS_ECDSA_PRIVATE_KEY_SIZE];
   unsigned char  masterkey_aes[VFS_MASTER_KEY_SIZE];
   unsigned char  tls_certificate[G_N_ELEMENTS (TLS_CERTIFICATE_BASE)];
-};
+} VfsInit;
 
 static void
-vfs_init_free (struct vfs_init_t *vinit)
+vfs_init_free (VfsInit *vinit)
 {
   g_clear_pointer (&vinit->main_seed, g_free);
   g_free (vinit);
@@ -172,17 +172,17 @@ static gboolean tls_decrypt (FpDevice            *dev,
                              unsigned char       *output_buffer,
                              int                 *output_len);
 
-struct async_usb_operation_data_t
+typedef struct _VfsAsyncUsbOperationData
 {
   FpiUsbTransferCallback callback;
   void                  *callback_data;
-};
+} VfsAsyncUsbOperationData;
 
 static void
 async_write_callback (FpiUsbTransfer *transfer, FpDevice *device,
                       gpointer user_data, GError *error)
 {
-  g_autofree struct async_usb_operation_data_t *op_data = user_data;
+  g_autofree VfsAsyncUsbOperationData *op_data = user_data;
   FpiDeviceVfs0090 *vdev;
 
   if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
@@ -221,14 +221,14 @@ async_write_to_usb (FpDevice *dev,
                     const unsigned char *data, int data_size,
                     FpiUsbTransferCallback callback, gpointer callback_data)
 {
-  struct async_usb_operation_data_t *op_data;
+  VfsAsyncUsbOperationData *op_data;
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpiUsbTransfer *transfer;
 
   g_assert_true (!vdev->cancellable ||
                  g_cancellable_is_cancelled (vdev->cancellable));
 
-  op_data = g_new0 (struct async_usb_operation_data_t, 1);
+  op_data = g_new0 (VfsAsyncUsbOperationData, 1);
   op_data->callback = callback;
   op_data->callback_data = callback_data;
 
@@ -246,7 +246,7 @@ static void
 async_read_callback (FpiUsbTransfer *transfer, FpDevice *device,
                      gpointer user_data, GError *error)
 {
-  g_autofree struct async_usb_operation_data_t *op_data = user_data;
+  g_autofree VfsAsyncUsbOperationData *op_data = user_data;
   FpiDeviceVfs0090 *vdev;
 
   if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
@@ -280,7 +280,7 @@ async_read_from_usb (FpDevice *dev, FpiTransferType transfer_type,
                      unsigned char *buffer, int buffer_size,
                      FpiUsbTransferCallback callback, gpointer callback_data)
 {
-  struct async_usb_operation_data_t *op_data;
+  VfsAsyncUsbOperationData *op_data;
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpiUsbTransfer *transfer;
   guint timeout = VFS_USB_TIMEOUT;
@@ -291,7 +291,7 @@ async_read_from_usb (FpDevice *dev, FpiTransferType transfer_type,
   transfer = fpi_usb_transfer_new (dev);
   g_set_object (&vdev->cancellable, g_cancellable_new ());
 
-  op_data = g_new0 (struct async_usb_operation_data_t, 1);
+  op_data = g_new0 (VfsAsyncUsbOperationData, 1);
   op_data->callback = callback;
   op_data->callback_data = callback_data;
 
@@ -318,20 +318,20 @@ async_read_from_usb (FpDevice *dev, FpiTransferType transfer_type,
                            async_read_callback, op_data);
 }
 
-struct async_usb_encrypted_operation_data_t
+typedef struct _VfsAsyncUsbEncryptedOperationData
 {
   FpiUsbTransferCallback callback;
   void                  *callback_data;
 
   unsigned char         *encrypted_data;
   int                    encrypted_data_size;
-};
+} VfsAsyncUsbEncryptedOperationData;
 
 static void
 async_write_encrypted_callback (FpiUsbTransfer *transfer, FpDevice *dev,
                                 gpointer data, GError *error)
 {
-  g_autofree struct async_usb_encrypted_operation_data_t *enc_op = data;
+  g_autofree VfsAsyncUsbEncryptedOperationData *enc_op = data;
 
   if (enc_op->callback)
     enc_op->callback (transfer, dev, enc_op->callback_data, error);
@@ -348,14 +348,14 @@ async_write_encrypted_to_usb (FpDevice              *dev,
                               FpiUsbTransferCallback callback,
                               gpointer               callback_data)
 {
-  struct async_usb_encrypted_operation_data_t *enc_op;
+  VfsAsyncUsbEncryptedOperationData *enc_op;
   unsigned char *encrypted_data;
   int encrypted_data_size;
 
   encrypted_data = tls_encrypt (dev, data, data_size,
                                 &encrypted_data_size);
 
-  enc_op = g_new0 (struct async_usb_encrypted_operation_data_t, 1);
+  enc_op = g_new0 (VfsAsyncUsbEncryptedOperationData, 1);
   enc_op->callback = callback;
   enc_op->callback_data = callback_data;
   enc_op->encrypted_data = encrypted_data;
@@ -369,7 +369,7 @@ static void
 async_read_encrypted_callback (FpiUsbTransfer *transfer, FpDevice *dev,
                                gpointer data, GError *error)
 {
-  g_autofree struct async_usb_encrypted_operation_data_t *enc_op = data;
+  g_autofree VfsAsyncUsbEncryptedOperationData *enc_op = data;
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
 
   enc_op->encrypted_data = g_memdup (vdev->buffer, vdev->buffer_length);
@@ -399,9 +399,9 @@ async_read_decrypt_from_usb (FpDevice *dev, FpiTransferType transfer_type,
                              unsigned char *buffer, int buffer_size,
                              FpiUsbTransferCallback callback, gpointer callback_data)
 {
-  struct async_usb_encrypted_operation_data_t *enc_op;
+  VfsAsyncUsbEncryptedOperationData *enc_op;
 
-  enc_op = g_new0 (struct async_usb_encrypted_operation_data_t, 1);
+  enc_op = g_new0 (VfsAsyncUsbEncryptedOperationData, 1);
   enc_op->callback = callback;
   enc_op->callback_data = callback_data;
 
@@ -409,7 +409,7 @@ async_read_decrypt_from_usb (FpDevice *dev, FpiTransferType transfer_type,
                        async_read_encrypted_callback, enc_op);
 }
 
-struct async_data_exchange_t
+typedef struct _VfsAsyncDataExchange
 {
   FpiUsbTransferCallback callback;
   gpointer               callback_data;
@@ -417,13 +417,13 @@ struct async_data_exchange_t
   int                    exchange_mode;
   unsigned char         *buffer;
   int                    buffer_size;
-};
+} VfsAsyncDataExchange;
 
 static void
 on_async_data_exchange_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                            gpointer data, GError *error)
 {
-  g_autofree struct async_data_exchange_t *dex = data;
+  g_autofree VfsAsyncDataExchange *dex = data;
 
   g_assert_nonnull (dex);
 
@@ -457,9 +457,9 @@ async_data_exchange (FpDevice *dev, int exchange_mode,
                      unsigned char *buffer, int buffer_size,
                      FpiUsbTransferCallback callback, gpointer callback_data)
 {
-  struct async_data_exchange_t *dex;
+  VfsAsyncDataExchange *dex;
 
-  dex = g_new0 (struct async_data_exchange_t, 1);
+  dex = g_new0 (VfsAsyncDataExchange, 1);
   dex->buffer = buffer;
   dex->buffer_size = buffer_size;
   dex->callback = callback;
@@ -498,7 +498,7 @@ async_transfer_callback_with_ssm (FpiUsbTransfer *transfer, FpDevice *dev,
 }
 
 static void
-generate_main_seed (FpDevice *dev, struct vfs_init_t *vinit)
+generate_main_seed (FpDevice *dev, VfsInit *vinit)
 {
   char name[NAME_MAX], serial[NAME_MAX];
   FILE *name_file, *serial_file;
@@ -754,7 +754,7 @@ tls_decrypt (FpDevice *dev,
 }
 
 static gboolean
-check_data_exchange (FpiDeviceVfs0090 *vdev, const struct data_exchange_t *dex)
+check_data_exchange (FpiDeviceVfs0090 *vdev, const VfsDataExchange *dex)
 {
   if (dex->rsp_length >= 0 && vdev->buffer_length != dex->rsp_length)
     {
@@ -783,7 +783,7 @@ check_data_exchange (FpiDeviceVfs0090 *vdev, const struct data_exchange_t *dex)
 }
 
 static gboolean
-check_data_exchange_dbg (FpiDeviceVfs0090 *vdev, const struct data_exchange_t *dex)
+check_data_exchange_dbg (FpiDeviceVfs0090 *vdev, const VfsDataExchange *dex)
 {
   gboolean ret = check_data_exchange (vdev, dex);
 
@@ -799,17 +799,17 @@ check_data_exchange_dbg (FpiDeviceVfs0090 *vdev, const struct data_exchange_t *d
   return ret;
 }
 
-struct data_exchange_async_data_t
+typedef struct _VfsDataExchangeAsyncData
 {
-  FpiSsm                       *ssm;
-  const struct data_exchange_t *dex;
-};
+  FpiSsm                *ssm;
+  const VfsDataExchange *dex;
+} VfsDataExchangeAsyncData;
 
 static void
 on_data_exchange_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                      gpointer data, GError *error)
 {
-  g_autofree struct data_exchange_async_data_t *dex_data = data;
+  g_autofree VfsDataExchangeAsyncData *dex_data = data;
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
 
   if (!error)
@@ -832,11 +832,11 @@ on_data_exchange_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
 static void
 do_data_exchange (FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
-                  const struct data_exchange_t *dex, int mode)
+                  const VfsDataExchange *dex, int mode)
 {
-  struct data_exchange_async_data_t *dex_data;
+  VfsDataExchangeAsyncData *dex_data;
 
-  dex_data = g_new0 (struct data_exchange_async_data_t, 1);
+  dex_data = g_new0 (VfsDataExchangeAsyncData, 1);
   dex_data->ssm = ssm;
   dex_data->dex = dex;
 
@@ -906,7 +906,7 @@ reverse_mem (unsigned char * data, int size)
 }
 
 static gboolean
-initialize_ecdsa_key (struct vfs_init_t *vinit, unsigned char *enc_data, int res_len)
+initialize_ecdsa_key (VfsInit *vinit, unsigned char *enc_data, int res_len)
 {
   int tlen1 = 0, tlen2;
   g_autofree unsigned char *res = NULL;
@@ -949,7 +949,7 @@ initialize_ecdsa_key (struct vfs_init_t *vinit, unsigned char *enc_data, int res
 }
 
 static gboolean
-make_ecdsa_key (struct vfs_init_t *vinit, unsigned char *data)
+make_ecdsa_key (VfsInit *vinit, unsigned char *data)
 {
   if (!initialize_ecdsa_key (vinit, data + 0x52, 0x70))
     return FALSE;
@@ -1039,19 +1039,19 @@ sign2 (EC_KEY * key, unsigned char *data, int data_len)
   return res;
 }
 
-struct tls_handshake_t
+typedef struct _VfsTlsHandshake
 {
-  struct vfs_init_t *vinit;
-  HASHContext       *tls_hash_context;
-  HASHContext       *tls_hash_context2;
-  unsigned char      read_buffer[VFS_USB_BUFFER_SIZE];
-  unsigned char      client_random[0x20];
-  unsigned char      master_secret[0x30];
-  unsigned char     *client_hello;
-};
+  VfsInit       *vinit;
+  HASHContext   *tls_hash_context;
+  HASHContext   *tls_hash_context2;
+  unsigned char  read_buffer[VFS_USB_BUFFER_SIZE];
+  unsigned char  client_random[0x20];
+  unsigned char  master_secret[0x30];
+  unsigned char *client_hello;
+} VfsTlsHandshake;
 
 static void
-tls_handshake_free (struct tls_handshake_t *tlshd)
+tls_handshake_free (VfsTlsHandshake *tlshd)
 {
   HASH_Destroy (tlshd->tls_hash_context);
   HASH_Destroy (tlshd->tls_hash_context2);
@@ -1063,8 +1063,8 @@ static void
 handshake_ssm (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
-  struct tls_handshake_t *tlshd = fpi_ssm_get_data (ssm);
-  struct vfs_init_t *vinit = tlshd->vinit;
+  VfsTlsHandshake *tlshd = fpi_ssm_get_data (ssm);
+  VfsInit *vinit = tlshd->vinit;
   GError *error = NULL;
 
   switch(fpi_ssm_get_cur_state (ssm))
@@ -1251,14 +1251,14 @@ handshake_ssm (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
-start_handshake_ssm (FpDevice          *dev,
-                     FpiSsm            *parent_ssm,
-                     struct vfs_init_t *vinit)
+start_handshake_ssm (FpDevice *dev,
+                     FpiSsm   *parent_ssm,
+                     VfsInit  *vinit)
 {
   FpiSsm *ssm;
-  struct tls_handshake_t *tlshd;
+  VfsTlsHandshake *tlshd;
 
-  tlshd = g_new0 (struct tls_handshake_t, 1);
+  tlshd = g_new0 (VfsTlsHandshake, 1);
   tlshd->vinit = vinit;
 
   ssm = fpi_ssm_new (dev, handshake_ssm,
@@ -1362,7 +1362,7 @@ static void
 init_ssm (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
-  struct vfs_init_t *vinit = fpi_ssm_get_data (ssm);
+  VfsInit *vinit = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -1547,7 +1547,7 @@ dev_open (FpDevice *dev)
 
   /* Clearing previous device state */
   ssm = fpi_ssm_new (dev, init_ssm, INIT_STATE_LAST);
-  fpi_ssm_set_data (ssm, g_new0 (struct vfs_init_t, 1), (GDestroyNotify) vfs_init_free);
+  fpi_ssm_set_data (ssm, g_new0 (VfsInit, 1), (GDestroyNotify) vfs_init_free);
   fpi_ssm_start (ssm, dev_open_callback);
 }
 
@@ -1569,18 +1569,18 @@ led_blink_callback_with_ssm (FpiUsbTransfer *transfer, FpDevice *dev,
     }
 }
 
-struct image_download_t
+typedef struct _VfsImageDownload
 {
   FpiSsm       *parent_ssm;
 
   unsigned char image[VFS_IMAGE_SIZE * VFS_IMAGE_SIZE];
   int           image_size;
-};
+} VfsImageDownload;
 
 static void
 finger_image_download_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  struct image_download_t *imgdown = fpi_ssm_get_data (ssm);
+  VfsImageDownload *imgdown = fpi_ssm_get_data (ssm);
 
   if (!error)
     {
@@ -1739,8 +1739,8 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
 }
 
 static void
-finger_image_submit (FpDevice                *dev,
-                     struct image_download_t *imgdown)
+finger_image_submit (FpDevice         *dev,
+                     VfsImageDownload *imgdown)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpImage *img;
@@ -1770,7 +1770,7 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpiSsm *ssm = data;
-  struct image_download_t *imgdown = fpi_ssm_get_data (ssm);
+  VfsImageDownload *imgdown = fpi_ssm_get_data (ssm);
   int offset = (fpi_ssm_get_cur_state (ssm) == IMAGE_DOWNLOAD_STATE_1) ? 0x12 : 0x06;
   int data_size = vdev->buffer_length - offset;
 
@@ -1791,7 +1791,7 @@ static void
 finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
-  struct image_download_t *imgdown = fpi_ssm_get_data (ssm);
+  VfsImageDownload *imgdown = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
   const unsigned char read_buffer_request[] = {
@@ -1871,9 +1871,9 @@ start_finger_image_download_subsm (FpDevice *dev,
                                    FpiSsm   *parent_ssm)
 {
   FpiSsm *ssm;
-  struct image_download_t *imgdown;
+  VfsImageDownload *imgdown;
 
-  imgdown = g_new0 (struct image_download_t, 1);
+  imgdown = g_new0 (VfsImageDownload, 1);
   imgdown->parent_ssm = parent_ssm;
 
   ssm = fpi_ssm_new (dev,
@@ -1884,16 +1884,16 @@ start_finger_image_download_subsm (FpDevice *dev,
   fpi_ssm_start (ssm, finger_image_download_callback);
 }
 
-struct scan_error_handler_data_t
+typedef struct _VfsScanErrorHandlerData
 {
   FpDeviceRetry retry;
   FpiSsm       *parent_ssm;
-};
+} VfsScanErrorHandlerData;
 
 static void
 scan_error_handler_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  struct scan_error_handler_data_t *error_data = fpi_ssm_get_data (ssm);
+  VfsScanErrorHandlerData *error_data = fpi_ssm_get_data (ssm);
 
   if (error)
     {
@@ -1941,7 +1941,7 @@ static void
 scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
-  struct scan_error_handler_data_t *error_data = fpi_ssm_get_data (ssm);
+  VfsScanErrorHandlerData *error_data = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -1977,10 +1977,10 @@ start_scan_error_handler_ssm (FpDevice     *dev,
                               FpiSsm       *parent_ssm,
                               FpDeviceRetry retry)
 {
-  struct scan_error_handler_data_t *error_data;
+  VfsScanErrorHandlerData *error_data;
   FpiSsm *ssm;
 
-  error_data = g_new0 (struct scan_error_handler_data_t, 1);
+  error_data = g_new0 (VfsScanErrorHandlerData, 1);
   error_data->retry = retry;
   error_data->parent_ssm = parent_ssm;
 
@@ -2455,7 +2455,7 @@ dev_probe (FpDevice *dev)
     }
 
   ssm = fpi_ssm_new (dev, init_ssm, PROBE_STATE_LAST);
-  fpi_ssm_set_data (ssm, g_new0 (struct vfs_init_t, 1), (GDestroyNotify) vfs_init_free);
+  fpi_ssm_set_data (ssm, g_new0 (VfsInit, 1), (GDestroyNotify) vfs_init_free);
   fpi_ssm_start (ssm, dev_probe_callback);
 }
 

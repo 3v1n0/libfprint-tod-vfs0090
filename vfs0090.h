@@ -156,14 +156,14 @@ enum DATA_EXCHANGE_MODE {
   DATA_EXCHANGE_ENCRYPTED,
 };
 
-struct data_exchange_t
+typedef struct _VfsDataExchange
 {
   gboolean             weak_match;
   const unsigned char *msg;
   int                  msg_length;
   const unsigned char *rsp;
   int                  rsp_length;
-};
+} VfsDataExchange;
 
 const unsigned char TEST_SEED[] = "VirtualBox\0" "0";
 
@@ -257,7 +257,7 @@ static const unsigned char INIT_SEQUENCE_MSG6[] = {
   0x00, 0x00, 0x10, 0x00, 0x00
 };
 
-static const struct data_exchange_t INIT_SEQUENCES[] = {
+static const VfsDataExchange INIT_SEQUENCES[] = {
   {
     .msg = INIT_SEQUENCE_MSG1,
     .msg_length = G_N_ELEMENTS (INIT_SEQUENCE_MSG1),
@@ -630,7 +630,7 @@ unsigned char SCAN_MATRIX[] = {
   0x7f
 };
 
-static const struct data_exchange_t ACTIVATE_SEQUENCES[] = {
+static const VfsDataExchange ACTIVATE_SEQUENCES[] = {
   {
     .msg = ACTIVATE_SEQUENCE_MSG1,
     .msg_length = G_N_ELEMENTS (ACTIVATE_SEQUENCE_MSG1),
@@ -684,14 +684,14 @@ static const struct data_exchange_t ACTIVATE_SEQUENCES[] = {
   },
 };
 
-static const struct data_exchange_t MATRIX_ALREADY_ACTIVATED_DEX = {
+static const VfsDataExchange MATRIX_ALREADY_ACTIVATED_DEX = {
   .msg = SCAN_MATRIX,
   .msg_length = G_N_ELEMENTS (SCAN_MATRIX),
   .rsp = (unsigned char[]){ 0x50, 0x04 },
   .rsp_length = 2,
 };
 
-static const struct data_exchange_t DEACTIVATE_SEQUENCES[] = {
+static const VfsDataExchange DEACTIVATE_SEQUENCES[] = {
   {
     .msg = (unsigned char[]){ 0x60, 0x00, 0x00, 0x00, 0x00 },
     .msg_length = 5,

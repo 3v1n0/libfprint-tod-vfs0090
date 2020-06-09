@@ -18,10 +18,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "fpi-device.h"
 #define FP_COMPONENT "vfs0090"
 
-// #include "fpi-device.h"
 #include "drivers_api.h"
 
 #include <errno.h>
@@ -47,13 +45,19 @@
 /* The main driver structure */
 struct _FpiDeviceVfs0090
 {
-  FpImageDevice parent;
-  gboolean      activated;
-  gboolean      deactivating;
+  FpDevice parent;
+
+  gboolean activated;
+  gboolean deactivating;
 
   /* Buffer for saving usb data through states */
   unsigned char *buffer;
   int            buffer_length;
+
+  unsigned int   enroll_stage;
+  GError        *action_error;
+  FpPrint       *enrolled_print;
+  FpImage       *captured_image;
 
   /* TLS keyblock for current session */
   unsigned char key_block[0x120];
@@ -62,7 +66,7 @@ struct _FpiDeviceVfs0090
   GCancellable *cancellable;
 };
 
-G_DEFINE_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FP_TYPE_IMAGE_DEVICE)
+G_DEFINE_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FP_TYPE_DEVICE)
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_CIPHER_CTX, EVP_CIPHER_CTX_free);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (ECDSA_SIG, ECDSA_SIG_free);
@@ -136,6 +140,7 @@ print_hex_gn (unsigned char *data, int len, int sz)
   puts ("");
 }
 
+#if 0
 static void
 print_hex_string (char *data, int len)
 {
@@ -143,6 +148,7 @@ print_hex_string (char *data, int len)
     printf ("%02x", data[i]);
   puts ("");
 }
+#endif
 
 static void
 print_hex (unsigned char *data, int len)
@@ -150,7 +156,10 @@ print_hex (unsigned char *data, int len)
   print_hex_gn (data, len, 1);
 }
 
+static void dev_deactivate (FpDevice *dev);
 static void start_reactivate_ssm (FpDevice *dev);
+static gboolean vfs0090_deinit (FpiDeviceVfs0090 *vdev,
+                                GError          **error);
 
 /* remove emmmeeme */
 static unsigned char *tls_encrypt (FpDevice            *dev,
@@ -204,7 +213,7 @@ out:
   if (op_data && op_data->callback)
     op_data->callback (transfer, device, op_data->callback_data, error);
   else if (error)
-    fpi_image_device_session_error (FP_IMAGE_DEVICE (device), error);
+    fpi_device_action_error (device, error);
 }
 
 static void
@@ -263,7 +272,7 @@ out:
   if (op_data && op_data->callback)
     op_data->callback (transfer, device, op_data->callback_data, error);
   else if (error)
-    fpi_image_device_session_error (FP_IMAGE_DEVICE (device), error);
+    fpi_device_action_error (device, error);
 }
 
 static void
@@ -570,8 +579,8 @@ usb_operation_perform (const char *op, gboolean ret, FpDevice *dev, GError **err
         if (ret != TRUE) {
                 fp_err("OpenSSL operation failed: %d", ret);
                 error = fpi_device_error_new_msg FP_DEVICE_ERROR_GENERAL,
-                                                 (idev) {
-                        fpi_image_device_session_error(idev, error);
+                                                 (dev) {
+                        fpi_device_action_error(dev, error);
                 }
                 return FALSE;
         }
@@ -1053,8 +1062,7 @@ tls_handshake_free (struct tls_handshake_t *tlshd)
 static void
 handshake_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   struct tls_handshake_t *tlshd = fpi_ssm_get_data (ssm);
   struct vfs_init_t *vinit = tlshd->vinit;
   GError *error = NULL;
@@ -1243,7 +1251,7 @@ handshake_ssm (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
-start_handshake_ssm (FpImageDevice     *idev,
+start_handshake_ssm (FpDevice          *dev,
                      FpiSsm            *parent_ssm,
                      struct vfs_init_t *vinit)
 {
@@ -1253,7 +1261,7 @@ start_handshake_ssm (FpImageDevice     *idev,
   tlshd = g_new0 (struct tls_handshake_t, 1);
   tlshd->vinit = vinit;
 
-  ssm = fpi_ssm_new (FP_DEVICE (idev), handshake_ssm,
+  ssm = fpi_ssm_new (dev, handshake_ssm,
                      TLS_HANDSHAKE_STATE_LAST);
   fpi_ssm_set_data (ssm, tlshd, (GDestroyNotify) tls_handshake_free);
   fpi_ssm_start_subsm (parent_ssm, ssm);
@@ -1353,7 +1361,6 @@ send_init_sequence (FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 static void
 init_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   struct vfs_init_t *vinit = fpi_ssm_get_data (ssm);
   GError *error = NULL;
@@ -1457,7 +1464,7 @@ init_ssm (FpiSsm *ssm, FpDevice *dev)
       }
 
     case INIT_STATE_HANDSHAKE:
-      start_handshake_ssm (idev, ssm, vinit);
+      start_handshake_ssm (dev, ssm, vinit);
       break;
 
     default:
@@ -1467,27 +1474,18 @@ init_ssm (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
-static FpiImageDeviceState
-get_imgdev_state (FpImageDevice *idev)
-{
-  FpiImageDeviceState state;
-
-  g_object_get (idev, "fpi-image-device-state", &state, NULL);
-  return state;
-}
-
 /* Callback for dev_open ssm */
 static void
 dev_open_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   /* Notify open complete */
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-
   if (error)
-    fpi_image_device_session_error (idev, error);
+    fpi_device_action_error (dev, error);
 
   if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-    fpi_image_device_open_complete (idev, error);
+    fpi_device_open_complete (dev, error);
+  else
+    vfs0090_deinit (FPI_DEVICE_VFS0090 (dev), NULL);
 }
 
 static gboolean
@@ -1539,16 +1537,16 @@ vfs0090_init (FpiDeviceVfs0090 *vdev)
 
 /* Open device */
 static void
-dev_open (FpImageDevice *idev)
+dev_open (FpDevice *dev)
 {
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpiSsm *ssm;
 
   if (!vfs0090_init (vdev))
     return;
 
   /* Clearing previous device state */
-  ssm = fpi_ssm_new (FP_DEVICE (idev), init_ssm, INIT_STATE_LAST);
+  ssm = fpi_ssm_new (dev, init_ssm, INIT_STATE_LAST);
   fpi_ssm_set_data (ssm, g_new0 (struct vfs_init_t, 1), (GDestroyNotify) vfs_init_free);
   fpi_ssm_start (ssm, dev_open_callback);
 }
@@ -1602,9 +1600,149 @@ finger_image_download_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 }
 
 static void
-finger_image_submit (FpImageDevice           *idev,
+minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
+{
+  g_autoptr(FpImage) image = FP_IMAGE (source_object);
+  g_autoptr(FpPrint) print = NULL;
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (user_data);
+  FpDevice *dev = FP_DEVICE (vdev);
+  GError *error = NULL;
+  FpiDeviceAction action;
+
+  if (!fp_image_detect_minutiae_finish (image, res, &error))
+    {
+      /* Cancel operation */
+      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        {
+          vdev->action_error = g_steal_pointer (&error);
+          dev_deactivate (dev);
+          return;
+        }
+
+      /* Replace error with a retry condition. */
+      g_warning ("Failed to detect minutiae: %s", error->message);
+      g_clear_pointer (&error, g_error_free);
+
+      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
+                                        "Minutiae detection failed, please retry");
+    }
+
+  action = fpi_device_get_current_action (dev);
+
+  if (action == FPI_DEVICE_ACTION_CAPTURE)
+    {
+      vdev->action_error = g_steal_pointer (&error);
+      vdev->captured_image = g_steal_pointer (&image);
+
+      dev_deactivate (dev);
+      return;
+    }
+
+  if (!error)
+    {
+      print = fp_print_new (dev);
+      fpi_print_set_type (print, FPI_PRINT_NBIS);
+
+      if (!fpi_print_add_from_image (print, image, &error))
+        {
+          g_clear_object (&print);
+
+          if (error->domain != FP_DEVICE_RETRY)
+            {
+              vdev->action_error = g_steal_pointer (&error);
+              dev_deactivate (dev);
+              return;
+            }
+        }
+    }
+
+  switch (action)
+    {
+    case FPI_DEVICE_ACTION_ENROLL:
+      {
+        FpPrint *enroll_print;
+        fpi_device_get_enroll_data (dev, &enroll_print);
+
+        if (print)
+          {
+            fpi_print_add_print (enroll_print, print);
+            vdev->enroll_stage += 1;
+          }
+
+        fpi_device_enroll_progress (dev, vdev->enroll_stage,
+                                    g_steal_pointer (&print), error);
+
+        /* Start another scan or deactivate. */
+        if (vdev->enroll_stage == fp_device_get_nr_enroll_stages (dev))
+          {
+            vdev->enrolled_print = g_object_ref (enroll_print);
+            dev_deactivate (dev);
+          }
+        else
+          {
+            start_reactivate_ssm (dev);
+          }
+        break;
+      }
+
+    case FPI_DEVICE_ACTION_VERIFY:
+      {
+        FpPrint *template;
+        FpiMatchResult result;
+
+        fpi_device_get_verify_data (dev, &template);
+        if (print)
+          result = fpi_print_bz3_match (template, print, VFS_BZ3_THRESHOLD, &error);
+        else
+          result = FPI_MATCH_ERROR;
+
+        if (!error || error->domain == FP_DEVICE_RETRY)
+          fpi_device_verify_report (dev, result, g_steal_pointer (&print),
+                                    g_steal_pointer (&error));
+
+        vdev->action_error = g_steal_pointer (&error);
+        /* Add led blinking! */
+        dev_deactivate (dev);
+        break;
+      }
+
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      {
+        gint i;
+        GPtrArray *templates;
+        FpPrint *result = NULL;
+
+        fpi_device_get_identify_data (dev, &templates);
+        for (i = 0; !error && i < templates->len; i++)
+          {
+            FpPrint *template = g_ptr_array_index (templates, i);
+
+            if (fpi_print_bz3_match (template, print, VFS_BZ3_THRESHOLD, &error) == FPI_MATCH_SUCCESS)
+              {
+                result = template;
+                break;
+              }
+          }
+
+        if (!error || error->domain == FP_DEVICE_RETRY)
+          fpi_device_identify_report (dev, result, g_steal_pointer (&print),
+                                      g_steal_pointer (&error));
+
+        vdev->action_error = g_steal_pointer (&error);
+        dev_deactivate (dev);
+        break;
+      }
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+static void
+finger_image_submit (FpDevice                *dev,
                      struct image_download_t *imgdown)
 {
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpImage *img;
 
   img = fp_image_new (VFS_IMAGE_SIZE, VFS_IMAGE_SIZE);
@@ -1619,8 +1757,11 @@ finger_image_submit (FpImageDevice           *idev,
       g_set_object (&img, resized);
     }
 
-  fp_dbg ("Submitting captured image");
-  fpi_image_device_image_captured (idev, img);
+  fp_dbg ("Detecting minutiae");
+  fp_image_detect_minutiae (img,
+                            vdev->cancellable,
+                            minutiae_detected,
+                            dev);
 }
 
 static void
@@ -1649,8 +1790,7 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
 static void
 finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   struct image_download_t *imgdown = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
@@ -1675,7 +1815,7 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 
 
     case IMAGE_DOWNLOAD_STATE_SUBMIT:
-      finger_image_submit (idev, imgdown);
+      finger_image_submit (dev, imgdown);
 
       /* FIXME: we can't get the state of the previous operation
        * with the new API, so let's just skip the red or green
@@ -1716,7 +1856,6 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT:
-      fpi_image_device_report_finger_status (idev, FALSE);
       fpi_ssm_next_state (ssm);
       break;
 
@@ -1728,8 +1867,8 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
-start_finger_image_download_subsm (FpImageDevice *idev,
-                                   FpiSsm        *parent_ssm)
+start_finger_image_download_subsm (FpDevice *dev,
+                                   FpiSsm   *parent_ssm)
 {
   FpiSsm *ssm;
   struct image_download_t *imgdown;
@@ -1737,7 +1876,7 @@ start_finger_image_download_subsm (FpImageDevice *idev,
   imgdown = g_new0 (struct image_download_t, 1);
   imgdown->parent_ssm = parent_ssm;
 
-  ssm = fpi_ssm_new (FP_DEVICE (idev),
+  ssm = fpi_ssm_new (dev,
                      finger_image_download_ssm,
                      IMAGE_DOWNLOAD_STATE_LAST);
 
@@ -1774,10 +1913,34 @@ scan_error_handler_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 }
 
 static void
+report_retry_error (FpDevice *dev, FpDeviceRetry retry)
+{
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  GError *error = fpi_device_retry_new (retry);
+
+  switch (fpi_device_get_current_action (dev))
+    {
+    case FPI_DEVICE_ACTION_ENROLL:
+      fpi_device_enroll_progress (dev, vdev->enroll_stage, NULL, error);
+      break;
+
+    case FPI_DEVICE_ACTION_VERIFY:
+      fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, error);
+      break;
+
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      fpi_device_identify_report (dev, NULL, NULL, error);
+      break;
+
+    default:
+      fpi_device_action_error (dev, error);
+    }
+}
+
+static void
 scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   struct scan_error_handler_data_t *error_data = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
@@ -1791,9 +1954,13 @@ scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_ERROR_STATE_REACTIVATE_REQUEST:
-      fpi_image_device_retry_scan (FP_IMAGE_DEVICE (dev),
-                                   error_data->retry);
-      fpi_image_device_report_finger_status (idev, FALSE);
+      report_retry_error (dev, error_data->retry);
+
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
+          vdev->enroll_stage < fp_device_get_nr_enroll_stages (dev))
+        start_reactivate_ssm (dev);
+      else
+        dev_deactivate (dev);
 
       fpi_ssm_next_state (ssm);
       break;
@@ -1806,9 +1973,9 @@ scan_error_handler_ssm (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
-start_scan_error_handler_ssm (FpImageDevice *idev,
-                              FpiSsm        *parent_ssm,
-                              FpDeviceRetry  retry)
+start_scan_error_handler_ssm (FpDevice     *dev,
+                              FpiSsm       *parent_ssm,
+                              FpDeviceRetry retry)
 {
   struct scan_error_handler_data_t *error_data;
   FpiSsm *ssm;
@@ -1817,7 +1984,7 @@ start_scan_error_handler_ssm (FpImageDevice *idev,
   error_data->retry = retry;
   error_data->parent_ssm = parent_ssm;
 
-  ssm = fpi_ssm_new (FP_DEVICE (idev), scan_error_handler_ssm,
+  ssm = fpi_ssm_new (dev, scan_error_handler_ssm,
                      SCAN_ERROR_STATE_LAST);
   fpi_ssm_set_data (ssm, error_data, g_free);
   fpi_ssm_start (ssm, scan_error_handler_callback);
@@ -1826,14 +1993,12 @@ start_scan_error_handler_ssm (FpImageDevice *idev,
 static void
 finger_scan_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-
   if (error && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
     {
       fp_err ("Scan failed failed at state %d, unexpected "
               "device reply during finger scanning", fpi_ssm_get_cur_state (ssm));
 
-      fpi_image_device_session_error (idev, error);
+      fpi_device_action_error (dev, error);
     }
   else
     {
@@ -1864,14 +2029,13 @@ finger_scan_interrupt_callback (FpiUsbTransfer *transfer, FpDevice *dev,
 static void
 finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case SCAN_STATE_FINGER_ON_SENSOR:
-      fpi_image_device_report_finger_status (idev, TRUE);
+      fp_dbg ("Finger on sensor...");
 
     case SCAN_STATE_WAITING_FOR_FINGER:
     case SCAN_STATE_IN_PROGRESS:
@@ -1884,15 +2048,15 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
 
     case SCAN_STATE_FAILED_TOO_SHORT:
     case SCAN_STATE_FAILED_TOO_FAST:
-      start_scan_error_handler_ssm (idev, ssm, FP_DEVICE_RETRY_TOO_SHORT);
+      start_scan_error_handler_ssm (dev, ssm, FP_DEVICE_RETRY_TOO_SHORT);
       break;
 
     case SCAN_STATE_SUCCESS_LOW_QUALITY:
-      if (fpi_device_get_current_action (FP_DEVICE (idev)) == FPI_DEVICE_ACTION_ENROLL)
+      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
         {
-          start_scan_error_handler_ssm (idev, ssm, FP_DEVICE_RETRY_CENTER_FINGER);
+          start_scan_error_handler_ssm (dev, ssm, FP_DEVICE_RETRY_CENTER_FINGER);
         }
-      else if (fpi_device_get_current_action (FP_DEVICE (idev)) == FPI_DEVICE_ACTION_VERIFY)
+      else if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
         {
           fp_warn ("Low quality image in verification, might fail");
           fpi_ssm_jump_to_state (ssm, SCAN_STATE_SUCCESS);
@@ -1900,7 +2064,7 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_STATE_SUCCESS:
-      start_finger_image_download_subsm (idev, ssm);
+      start_finger_image_download_subsm (dev, ssm);
       break;
 
     default:
@@ -1911,11 +2075,11 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
-start_finger_scan (FpImageDevice *idev)
+start_finger_scan (FpDevice *dev)
 {
   FpiSsm *ssm;
 
-  ssm = fpi_ssm_new (FP_DEVICE (idev), finger_scan_ssm, SCAN_STATE_LAST);
+  ssm = fpi_ssm_new (dev, finger_scan_ssm, SCAN_STATE_LAST);
   fpi_ssm_start (ssm, finger_scan_callback);
 }
 
@@ -1962,8 +2126,7 @@ activate_device_interrupt_callback (FpiUsbTransfer *transfer, FpDevice *dev,
 static void
 activate_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -2010,23 +2173,44 @@ activate_ssm (FpiSsm *ssm, FpDevice *dev)
 static void
 dev_activate_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
 
   if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) && error)
     fp_err ("Activation failed failed at state %d, unexpected "
             "device reply during activation", fpi_ssm_get_cur_state (ssm));
 
-  fpi_image_device_activate_complete (idev, error);
   vdev->activated = TRUE;
+
+  start_finger_scan (dev);
 }
 
 static void
-dev_activate (FpImageDevice *idev)
+dev_activate (FpDevice *dev)
 {
   FpiSsm *ssm;
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
 
-  ssm = fpi_ssm_new (FP_DEVICE (idev), activate_ssm, ACTIVATE_STATE_LAST);
+  if (action == FPI_DEVICE_ACTION_ENROLL)
+    {
+      FpPrint *enroll_print;
+      fpi_device_get_enroll_data (dev, &enroll_print);
+      fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
+    }
+  else if (action == FPI_DEVICE_ACTION_CAPTURE)
+    {
+      gboolean wait_for_finger;
+
+      fpi_device_get_capture_data (dev, &wait_for_finger);
+
+      if (!wait_for_finger)
+        {
+          fpi_device_action_error (dev,
+                                   fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+          return;
+        }
+    }
+
+  ssm = fpi_ssm_new (dev, activate_ssm, ACTIVATE_STATE_LAST);
   fpi_ssm_start (ssm, dev_activate_callback);
 }
 
@@ -2040,8 +2224,7 @@ send_deactivate_sequence (FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
 static void
 deactivate_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   GError *error = NULL;
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -2075,8 +2258,7 @@ deactivate_ssm (FpiSsm *ssm, FpDevice *dev)
 static void
 dev_deactivate_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
 
   if (error)
     {
@@ -2087,28 +2269,61 @@ dev_deactivate_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
                   fpi_ssm_get_cur_state (ssm));
         }
 
-      fpi_image_device_session_error (idev, error);
+      fpi_device_action_error (dev, g_steal_pointer (&error));
+    }
+  else if (vdev->action_error)
+    {
+      fpi_device_action_error (dev, g_steal_pointer (&vdev->action_error));
+    }
+  else
+    {
+      switch (fpi_device_get_current_action (dev))
+        {
+        case FPI_DEVICE_ACTION_ENROLL:
+          fpi_device_enroll_complete (dev,
+                                      g_steal_pointer (&vdev->enrolled_print),
+                                      NULL);
+          break;
+
+        case FPI_DEVICE_ACTION_CAPTURE:
+          fpi_device_capture_complete (dev,
+                                       g_steal_pointer (&vdev->captured_image),
+                                       NULL);
+          break;
+
+        case FPI_DEVICE_ACTION_VERIFY:
+          fpi_device_verify_complete (dev, NULL);
+          break;
+
+        case FPI_DEVICE_ACTION_IDENTIFY:
+          fpi_device_identify_complete (dev, NULL);
+          break;
+
+        default:
+          g_assert_not_reached ();
+        }
     }
 
   g_clear_object (&vdev->cancellable);
+  g_clear_object (&vdev->enrolled_print);
+  g_clear_object (&vdev->captured_image);
+  g_clear_error (&vdev->action_error);
 
-  fpi_image_device_deactivate_complete (idev, NULL);
-
-  vdev->activated = FALSE;
   vdev->deactivating = FALSE;
+  vdev->activated = FALSE;
 }
 
 static void
-dev_deactivate (FpImageDevice *idev)
+dev_deactivate (FpDevice *dev)
 {
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpiSsm *ssm;
 
   if (vdev->deactivating)
     return;
 
   vdev->deactivating = TRUE;
-  ssm = fpi_ssm_new (FP_DEVICE (idev), deactivate_ssm,
+  ssm = fpi_ssm_new (dev, deactivate_ssm,
                      DEACTIVATE_STATE_LAST);
   fpi_ssm_start (ssm, dev_deactivate_callback);
 }
@@ -2116,7 +2331,6 @@ dev_deactivate (FpImageDevice *idev)
 static void
 reactivate_ssm (FpiSsm *ssm, FpDevice *dev)
 {
-  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
   FpiSsm *child_ssm = NULL;
   GError *error = NULL;
 
@@ -2136,10 +2350,8 @@ reactivate_ssm (FpiSsm *ssm, FpDevice *dev)
                                ACTIVATE_STATE_LAST);
       break;
 
-    case REACTIVATE_STATE_MAYBE_SCAN:
-      if (get_imgdev_state (idev) == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
-        start_finger_scan (idev);
-
+    case REACTIVATE_STATE_SCAN:
+      start_finger_scan (dev);
       fpi_ssm_next_state (ssm);
       break;
 
@@ -2157,7 +2369,7 @@ static void
 reactivate_ssm_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   if (error)
-    fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
+    fpi_device_action_error (dev, error);
 }
 
 static void
@@ -2186,13 +2398,13 @@ vfs0090_deinit (FpiDeviceVfs0090 *vdev, GError **error)
 }
 
 static void
-dev_close (FpImageDevice *idev)
+dev_close (FpDevice *dev)
 {
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   GError *error = NULL;
 
-  if (vfs0090_deinit (vdev, &error))
-    fpi_image_device_close_complete (idev, error);
+  vfs0090_deinit (vdev, &error);
+  fpi_device_close_complete (dev, error);
 }
 
 static void
@@ -2248,24 +2460,34 @@ dev_probe (FpDevice *dev)
 }
 
 static void
-dev_change_state (FpImageDevice *idev, FpiImageDeviceState state)
+dev_cancel (FpDevice *dev)
 {
-  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (idev);
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
 
-  switch (state)
+  if (!fp_device_is_open (dev))
     {
-    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
-      if (!vdev->activated)
-        start_finger_scan (idev);
-      else
-        start_reactivate_ssm (FP_DEVICE (idev));
-      break;
-
-    case FPI_IMAGE_DEVICE_STATE_CAPTURE:
-    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
-    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
-      break;
+      g_cancellable_cancel (vdev->cancellable);
+      return;
     }
+
+  if (!vdev->activated)
+    {
+      GError *error = NULL;
+
+      g_cancellable_cancel (vdev->cancellable);
+
+      if (!vfs0090_deinit (vdev, &error))
+        fpi_device_action_error (dev, error);
+      return;
+    }
+
+  if (vdev->deactivating && vdev->action_error)
+    return;
+
+  g_set_error (&vdev->action_error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+               "Device action cancelled");
+
+  dev_deactivate (dev);
 }
 
 /* Usb id table of device */
@@ -2293,7 +2515,6 @@ static void
 fpi_device_vfs0090_class_init (FpiDeviceVfs0090Class *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
   object_class->dispose = fpi_device_vfs0090_dispose;
@@ -2303,16 +2524,15 @@ fpi_device_vfs0090_class_init (FpiDeviceVfs0090Class *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->nr_enroll_stages = 5;
   dev_class->probe = dev_probe;
 
-  img_class->img_open = dev_open;
-  img_class->img_close = dev_close;
-  img_class->activate = dev_activate;
-  img_class->deactivate = dev_deactivate;
-  img_class->change_state = dev_change_state;
+  dev_class->open = dev_open;
+  dev_class->close = dev_close;
 
-  img_class->bz3_threshold = 12;
-
-  img_class->img_width = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE;
-  img_class->img_height = VFS_IMAGE_SIZE * VFS_IMAGE_RESCALE;
+  dev_class->enroll = dev_activate;
+  dev_class->verify = dev_activate;
+  dev_class->identify = dev_activate;
+  dev_class->capture = dev_activate;
+  dev_class->cancel = dev_cancel;
 }

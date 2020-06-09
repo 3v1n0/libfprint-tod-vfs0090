@@ -20,9 +20,9 @@
 
 #pragma once
 
-#include "fpi-image-device.h"
+#include "fpi-device.h"
 
-G_DECLARE_FINAL_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FPI, DEVICE_VFS0090, FpImageDevice)
+G_DECLARE_FINAL_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FPI, DEVICE_VFS0090, FpDevice)
 
 #define DMI_PRODUCT_NAME_NODE "/sys/class/dmi/id/product_name"
 #define DMI_PRODUCT_SERIAL_NODE "/sys/class/dmi/id/product_serial"
@@ -38,6 +38,7 @@ G_DECLARE_FINAL_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FPI, DEVICE_VFS0090,
 #define VFS_ECDSA_SIGNATURE_SIZE 0x48
 #define VFS_IMAGE_SIZE 144
 #define VFS_IMAGE_RESCALE 2
+#define VFS_BZ3_THRESHOLD 12
 
 enum INIT_STATES {
   INIT_STATE_GENERATE_MAIN_SEED,
@@ -145,7 +146,7 @@ enum REACTIVATE_STATES {
   REACTIVATE_STATE_WAIT,
   REACTIVATE_STATE_DEACTIVATE,
   REACTIVATE_STATE_ACTIVATE,
-  REACTIVATE_STATE_MAYBE_SCAN,
+  REACTIVATE_STATE_SCAN,
 
   REACTIVATE_STATE_LAST
 };

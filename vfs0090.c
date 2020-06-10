@@ -1381,13 +1381,16 @@ init_ssm (FpiSsm *ssm, FpDevice *dev)
               error = fpi_device_error_new_msg (
                 FP_DEVICE_ERROR_NOT_SUPPORTED,
                 "Sensor not initialized, init byte is 0x%x " \
-                "(should be 0x07 on initialized devices, 0x02 " \
-                "otherwise)\n" \
-                "This is a driver in alpha state and the " \
-                "device needs to be setup in a VirtualBox " \
-                "instance running Windows, or with a native " \
-                "Windows installation first.",
+                "(should be 0x07 on initialized devices, 0x02 otherwise)\n" \
+                "This is a driver in beta state and the device needs to be" \
+                "paired using external tools to load a non-free firmware.\n " \
+                "This can be done natively on Linux using the " \
+                "validity-sensors-tools, available at " \
+                "https://snapcraft.io/validity-sensors-tools\n" \
+                "Otherwise it's possible to use a VirtualBox VM running "
+                "Windows, or a native Windows installation.",
                 vdev->buffer[vdev->buffer_length - 1]);
+              fp_warn("%s", error->message);
               fpi_ssm_mark_failed (ssm, error);
               break;
             }

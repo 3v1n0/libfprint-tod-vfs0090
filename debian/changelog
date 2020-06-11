@@ -1,0 +1,5 @@
+libfprint-2-tod-vfs0090 (0.90~f1) focal; urgency=medium
+
+  * Initial Release.
+
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Thu, 11 Jun 2020 18:47:00 +0200

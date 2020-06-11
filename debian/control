@@ -1,0 +1,41 @@
+Source: libfprint-2-tod-vfs0090
+Section: misc
+Priority: optional
+Maintainer: Marco Trevisan (Treviño) <marco@ubuntu.com>
+Build-Depends: debhelper-compat (= 12),
+               libfprint-2-tod-dev,
+               libfprint-2-dev,
+               libglib2.0-dev,
+               libgusb-dev,
+               libpixman-1-dev,
+               libssl-dev,
+               libnss3-dev,
+               libusb-1.0-0-dev,
+               meson,
+               pkg-config,
+               udev
+Standards-Version: 4.4.1
+Homepage: https://gitlab.freedesktop.org/3v1n0/libfprint-tod-vfs0090/
+Vcs-Browser: https://gitlab.freedesktop.org/3v1n0/libfprint-tod-vfs0090/tree/master
+Vcs-Git: https://gitlab.freedesktop.org/3v1n0/libfprint-tod-vfs0090.git
+
+Package: libfprint-2-tod-vfs0090
+Architecture: any
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: libfprint TOD driver for vfs0090 devices
+ The fprint project aims to support for consumer fingerprint reader devices.
+ .
+ Previously, Linux support for such devices has been scattered amongst different
+ projects (many incomplete) and inconsistent in that application developers
+ would have to implement support for each type of fingerprint reader separately.
+ The idea is to change that by providing a central system to support all the
+ fingerprint readers as it's possible to get hands on.
+ .
+ libfprint is the centre of efforts, this component does the dirty job of
+ talking to fingerprint reading devices, and processing fingerprint data.
+ .
+ This library depends on the new libusb, which performs asynchronous callbacks,
+ allowing fprint to perform non-blocking device tasks.
+ .
+ This package includes the driver for Validity Sensors chip 0090

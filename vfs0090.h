@@ -24,6 +24,8 @@
 
 G_DECLARE_FINAL_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FPI, DEVICE_VFS0090, FpDevice)
 
+GType fpi_tod_shared_driver_get_type (void);
+
 #define DMI_PRODUCT_NAME_NODE "/sys/class/dmi/id/product_name"
 #define DMI_PRODUCT_SERIAL_NODE "/sys/class/dmi/id/product_serial"
 

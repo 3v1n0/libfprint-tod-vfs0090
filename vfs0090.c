@@ -69,6 +69,12 @@ struct _FpiDeviceVfs0090
 
 G_DEFINE_TYPE (FpiDeviceVfs0090, fpi_device_vfs0090, FP_TYPE_DEVICE)
 
+GType
+fpi_tod_shared_driver_get_type (void)
+{
+  return fpi_device_vfs0090_get_type ();
+}
+
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (EVP_CIPHER_CTX, EVP_CIPHER_CTX_free);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (ECDSA_SIG, ECDSA_SIG_free);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (EC_KEY, EC_KEY_free);

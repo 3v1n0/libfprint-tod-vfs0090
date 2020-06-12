@@ -1271,7 +1271,7 @@ start_handshake_ssm (FpDevice *dev,
 }
 
 static int
-translate_interrupt (unsigned char *interrupt, int interrupt_size)
+translate_interrupt (unsigned char *interrupt, int interrupt_size, GError **error)
 {
   const int expected_size = 5;
   const unsigned char waiting_finger[] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -1350,6 +1350,9 @@ translate_interrupt (unsigned char *interrupt, int interrupt_size)
 
   fp_err ("Interrupt not tracked, please report!");
   print_hex (interrupt, interrupt_size);
+
+  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+               "Unknown device interrupt");
 
   return VFS_SCAN_UNKNOWN;
 }
@@ -2020,13 +2023,14 @@ finger_scan_interrupt_callback (FpiUsbTransfer *transfer, FpDevice *dev,
   if (!error)
     {
       interrupt_type = translate_interrupt (vdev->buffer,
-                                            vdev->buffer_length);
-      fpi_ssm_jump_to_state (ssm, interrupt_type);
+                                            vdev->buffer_length,
+                                            &error);
     }
+
+  if (error)
+    fpi_ssm_mark_failed (ssm, error);
   else
-    {
-      fpi_ssm_mark_failed (ssm, error);
-    }
+    fpi_ssm_jump_to_state (ssm, interrupt_type);
 }
 
 static void
@@ -2109,9 +2113,13 @@ activate_device_interrupt_callback (FpiUsbTransfer *transfer, FpDevice *dev,
   if (!error)
     {
       interrupt_type = translate_interrupt (vdev->buffer,
-                                            vdev->buffer_length);
-
-      if (interrupt_type == VFS_SCAN_WAITING_FOR_FINGER)
+                                            vdev->buffer_length,
+                                            &error);
+      if (error)
+        {
+          fpi_ssm_mark_failed (ssm, error);
+        }
+      else if (interrupt_type == VFS_SCAN_WAITING_FOR_FINGER)
         {
           fpi_ssm_mark_completed (ssm);
         }

@@ -1809,6 +1809,11 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
       fpi_ssm_mark_failed (ssm, error);
       return;
     }
+  else if (data_size < 100)
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
+      return;
+    }
 
   memcpy (imgdown->image + imgdown->image_size, vdev->buffer + offset, data_size);
   imgdown->image_size += data_size;

@@ -2060,15 +2060,20 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_STATE_SUCCESS_LOW_QUALITY:
-      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
-        {
-          start_scan_error_handler_ssm (dev, ssm, FP_DEVICE_RETRY_CENTER_FINGER);
-        }
-      else if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
-        {
-          fp_warn ("Low quality image in verification, might fail");
-          fpi_ssm_jump_to_state (ssm, SCAN_STATE_SUCCESS);
-        }
+      {
+        FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+        if (action == FPI_DEVICE_ACTION_ENROLL)
+          {
+            start_scan_error_handler_ssm (dev, ssm, FP_DEVICE_RETRY_CENTER_FINGER);
+          }
+        else if (action == FPI_DEVICE_ACTION_VERIFY ||
+                 action == FPI_DEVICE_ACTION_IDENTIFY)
+          {
+            fp_warn ("Low quality image in verification, might fail");
+            fpi_ssm_jump_to_state (ssm, SCAN_STATE_SUCCESS);
+          }
+      }
       break;
 
     case SCAN_STATE_SUCCESS:

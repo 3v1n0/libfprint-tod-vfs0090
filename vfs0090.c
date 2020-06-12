@@ -605,6 +605,7 @@ hmac_make_context (const unsigned char *key_bytes, int key_len)
 
   SECItem key;
 
+  key.type = siBuffer;
   key.data = (unsigned char *) key_bytes;
   key.len = key_len;
 

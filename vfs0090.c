@@ -31,8 +31,6 @@
 #include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
-#include <stdio.h>
-#include <string.h>
 
 #include "vfs0090.h"
 
@@ -99,9 +97,6 @@ vfs_init_free (VfsInit *vinit)
   g_free (vinit);
 }
 
-/* DEBUGGG */
-#include <stdio.h>
-
 static void
 print_hex_gn (unsigned char *data, int len, int sz)
 {
@@ -114,18 +109,18 @@ print_hex_gn (unsigned char *data, int len, int sz)
         {
           if (i != 0)
             {
-              printf (" | ");
+              g_print (" | ");
               for (int j = i - 16; j < i; ++j)
-                printf ("%c", isprint (data[j * sz]) ? data[j * sz] : '.');
-              printf ("\n");
+                g_print ("%c", isprint (data[j * sz]) ? data[j * sz] : '.');
+              g_print ("\n");
             }
-          printf ("%04x ", i);
+          g_print ("%04x ", i);
         }
       else if ((i % 8) == 0)
         {
-          printf (" ");
+          g_print (" ");
         }
-      printf ("%02x ", data[i * sz]);
+      g_print ("%02x ", data[i * sz]);
     }
 
   if (((len - 1) % 16) != 0)
@@ -135,14 +130,14 @@ print_hex_gn (unsigned char *data, int len, int sz)
       int missing_spaces = missing_bytes * 3 + (missing_bytes >= 8 ? 1 : 0);
 
       for (int i = 0; i < missing_spaces; ++i)
-        printf (" ");
+        g_print (" ");
 
-      printf (" | ");
+      g_print (" | ");
 
       for (j = len - 1; j > 0 && (j % 16) != 0; --j)
         ;
       for (; j < len; ++j)
-        printf ("%c", isprint (data[j * sz]) ? data[j * sz] : '.');
+        g_print ("%c", isprint (data[j * sz]) ? data[j * sz] : '.');
     }
   puts ("");
 }
@@ -152,7 +147,7 @@ static void
 print_hex_string (char *data, int len)
 {
   for (int i = 0; i < len; i++)
-    printf ("%02x", data[i]);
+    g_print ("%02x", data[i]);
   puts ("");
 }
 #endif

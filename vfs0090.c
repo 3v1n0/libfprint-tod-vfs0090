@@ -2498,7 +2498,7 @@ dev_cancel (FpDevice *dev)
 
 /* Usb id table of device */
 static const FpIdEntry id_table[] = {
-  { .vid = 0x138a, .pid = 0x0090 },
+  { .vid = 0x138a, .pid = 0x0097 },
   { .vid = 0,  .pid = 0, .driver_data = 0 },
 };
 
@@ -2525,12 +2525,12 @@ fpi_device_vfs0090_class_init (FpiDeviceVfs0090Class *klass)
 
   object_class->dispose = fpi_device_vfs0090_dispose;
 
-  dev_class->id = "vfs0090";
-  dev_class->full_name = "Validity VFS0090";
+  dev_class->id = "vfs0097";
+  dev_class->full_name = "Validity VFS0097";
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  dev_class->nr_enroll_stages = 5;
+  dev_class->nr_enroll_stages = 1;
   dev_class->probe = dev_probe;
 
   dev_class->open = dev_open;
@@ -2539,6 +2539,5 @@ fpi_device_vfs0090_class_init (FpiDeviceVfs0090Class *klass)
   dev_class->enroll = dev_activate;
   dev_class->verify = dev_activate;
   dev_class->identify = dev_activate;
-  dev_class->capture = dev_activate;
   dev_class->cancel = dev_cancel;
 }

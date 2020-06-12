@@ -1,4 +1,4 @@
-libfprint-2-tod-vfs0090 (0.90~f2) focal; urgency=medium
+libfprint-2-tod-vfs0090 (0.90~f3) focal; urgency=medium
 
   * Fix handling of enroll results
 

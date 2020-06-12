@@ -1676,6 +1676,44 @@ finger_db_check_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
     }
 }
 
+/* Remove once included in TOD */
+static gchar *
+_fpi_print_generate_user_id (FpPrint *print)
+{
+  const gchar *username = NULL;
+  gchar *user_id = NULL;
+  const GDate *date;
+  gint y = 0, m = 0, d = 0;
+  gint32 rand_id = 0;
+
+  g_assert (print);
+  date = fp_print_get_enroll_date (print);
+  if (date && g_date_valid (date))
+    {
+      y = g_date_get_year (date);
+      m = g_date_get_month (date);
+      d = g_date_get_day (date);
+    }
+
+  username = fp_print_get_username (print);
+  if (!username)
+    username = "nobody";
+
+  if (g_strcmp0 (g_getenv ("FP_DEVICE_EMULATION"), "1") == 0)
+    rand_id = 0;
+  else
+    rand_id = g_random_int ();
+
+  user_id = g_strdup_printf ("FP1-%04d%02d%02d-%X-%08X-%s",
+                             y, m, d,
+                             fp_print_get_finger (print),
+                             rand_id,
+                             username);
+
+  return user_id;
+
+}
+
 static void
 handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
 {
@@ -1727,7 +1765,7 @@ handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
         finger_id = vdev->buffer[2];
 
         fpi_device_get_enroll_data (dev, &print);
-        user_id = fpi_print_generate_user_id (print);
+        user_id = _fpi_print_generate_user_id (print);
         data = g_variant_new ("(us)", finger_id, user_id);
 
         fpi_print_set_type (print, FPI_PRINT_RAW);

@@ -47,6 +47,8 @@ struct _FpiDeviceVfs0090
 
   gboolean activated;
   gboolean deactivating;
+  gboolean db_checked;
+  gboolean db_has_prints;
 
   /* Buffer for saving usb data through states */
   unsigned char *buffer;
@@ -162,6 +164,11 @@ static void dev_deactivate (FpDevice *dev);
 static void start_reactivate_ssm (FpDevice *dev);
 static gboolean vfs0090_deinit (FpiDeviceVfs0090 *vdev,
                                 GError          **error);
+static void finger_scan_interrupt_callback (FpiUsbTransfer *transfer,
+                                            FpDevice       *dev,
+                                            gpointer        data,
+                                            GError         *error);
+
 
 /* remove emmmeeme */
 static unsigned char *tls_encrypt (FpDevice            *dev,
@@ -576,7 +583,7 @@ usb_operation_perform (const char *op, gboolean ret, FpDevice *dev, GError **err
 }
 
 /*
-   static gboolean openssl_operation(int ret, struct fp_img_dev *idev)
+   static gboolean openssl_operation(int ret, FpDevice *dev)
    {
         if (ret != TRUE) {
                 fp_err("OpenSSL operation failed: %d", ret);
@@ -1280,6 +1287,9 @@ translate_interrupt (unsigned char *interrupt, int interrupt_size, GError **erro
   const unsigned char scan_completed[] = { 0x03, 0x41, 0x03, 0x00, 0x40 };
 
   const unsigned char scan_success[] = { 0x03, 0x43, 0x04, 0x00, 0x41 };
+  const unsigned char db_identified_prefix[] = { 0x03, 0x00 };
+  const unsigned char db_unidentified_prefix[] = { 0x04, 0x00 };
+  const unsigned char db_checked_sufix[] = { 0x00, 0xdb };
   const unsigned char low_quality_scan[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
   const unsigned char scan_failed_too_short[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
   const unsigned char scan_failed_too_short2[] = { 0x03, 0x61, 0x07, 0x00, 0x41 };
@@ -1325,6 +1335,28 @@ translate_interrupt (unsigned char *interrupt, int interrupt_size, GError **erro
     {
       fp_info ("Fingerprint scan success, but low quality...");
       return VFS_SCAN_SUCCESS_LOW_QUALITY;
+    }
+
+  if (expected_size == interrupt_size &&
+      memcmp (db_identified_prefix, interrupt,
+              sizeof (db_identified_prefix)) == 0 &&
+      memcmp (db_checked_sufix,
+              interrupt + interrupt_size - sizeof (db_checked_sufix),
+              sizeof (db_checked_sufix)) == 0)
+    {
+      fp_info ("Identified DB finger id %d", interrupt[2]);
+      return VFS_SCAN_DB_MATCH_SUCCESS;
+    }
+
+  if (expected_size == interrupt_size &&
+      memcmp (db_unidentified_prefix,
+              interrupt, sizeof (db_unidentified_prefix)) == 0 &&
+      memcmp (db_checked_sufix,
+              interrupt + interrupt_size - sizeof (db_checked_sufix),
+              sizeof (db_checked_sufix)) == 0)
+    {
+      fp_info ("Finger DB identification falied");
+      return VFS_SCAN_DB_MATCH_FAILED;
     }
 
   if (sizeof (scan_failed_too_short) == interrupt_size &&
@@ -1578,6 +1610,358 @@ led_blink_callback_with_ssm (FpiUsbTransfer *transfer, FpDevice *dev,
     }
 }
 
+static void
+restart_scan_or_deactivate (FpiDeviceVfs0090 *vdev)
+{
+  FpDevice *dev = FP_DEVICE (vdev);
+
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
+      vdev->enroll_stage < fp_device_get_nr_enroll_stages (dev))
+    start_reactivate_ssm (dev);
+  else
+    dev_deactivate (dev);
+}
+
+static gboolean
+scan_action_succeeded (FpiDeviceVfs0090 *vdev)
+{
+  return !vdev->action_error && vdev->match_result == FPI_MATCH_SUCCESS;
+}
+
+static gboolean
+finger_db_check_fallbacks_to_image (FpiDeviceVfs0090 *vdev)
+{
+  FpDevice *dev = FP_DEVICE (vdev);
+  FpiDeviceAction action;
+
+  if (!fp_device_supports_capture (dev))
+    return FALSE;
+
+  if (scan_action_succeeded (vdev))
+    return FALSE;
+
+  action = fpi_device_get_current_action (dev);
+
+  return action == FPI_DEVICE_ACTION_ENROLL ||
+         action == FPI_DEVICE_ACTION_IDENTIFY;
+}
+
+static void
+finger_db_check_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  FpiSsm *parent_ssm = fpi_ssm_get_data (ssm);
+
+  if (!error)
+    {
+      if (finger_db_check_fallbacks_to_image (vdev))
+        {
+          /* In these cases we may still have failed the DB identification, but
+          * we may still re-use the image-verification and so let's try agin */
+          vdev->db_has_prints = FALSE;
+          fpi_ssm_jump_to_state (parent_ssm, IMAGE_DOWNLOAD_STATE_SUBMIT_IMAGE);
+          vdev->db_has_prints = TRUE;
+        }
+      else
+        {
+          fpi_ssm_mark_completed (parent_ssm);
+        }
+    }
+  else
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        fp_err ("Scan failed failed at state %d, unexpected"
+                "device reply during db check", fpi_ssm_get_cur_state (ssm));
+      fpi_ssm_mark_failed (parent_ssm, error);
+    }
+}
+
+static void
+handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
+{
+  FpDevice *dev = FP_DEVICE (vdev);
+  FpiDeviceAction action;
+
+  vdev->match_result = result;
+  action = fpi_device_get_current_action (dev);
+
+  switch (action)
+    {
+    case FPI_DEVICE_ACTION_ENROLL:
+      {
+        g_autofree gchar *user_id = NULL;
+        FpPrint *print;
+        GVariant *data;
+        guint finger_id;
+
+        if (vdev->match_result != FPI_MATCH_SUCCESS)
+          {
+            fp_dbg ("Finger doesn't match any enrolled finger in DB");
+
+            if (fp_device_supports_capture (dev))
+              /* Returning here will cause fallig back to image enrolling  */
+              return;
+
+            /* We don't want to retry enrollment in this case, there's no point */
+            vdev->enroll_stage = fp_device_get_nr_enroll_stages (dev);
+            vdev->action_error =
+              fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
+                                        "This device currently only supports enrolling fingers " \
+                                        "that have been previously enrolled using external tools" \
+                                        "tools, use validity-sensors-tools, available at " \
+                                        "https://snapcraft.io/validity-sensors-tools\n" \
+                                        "Otherwise it's possible to use a VirtualBox VM running "
+                                        "Windows, or a native Windows installation.");
+            return;
+          }
+
+        while (vdev->enroll_stage < fp_device_get_nr_enroll_stages (dev))
+          {
+            /* Not nice, but we can't change the enroll stages at this point */
+            vdev->enroll_stage++;
+            fpi_device_enroll_progress (dev, vdev->enroll_stage,
+                                        NULL, NULL);
+          }
+
+        g_assert_true (vdev->buffer_length > 3);
+        finger_id = vdev->buffer[2];
+
+        fpi_device_get_enroll_data (dev, &print);
+        user_id = fpi_print_generate_user_id (print);
+        data = g_variant_new ("(us)", finger_id, user_id);
+
+        fpi_print_set_type (print, FPI_PRINT_RAW);
+        fpi_print_set_device_stored (print, TRUE);
+
+        fp_dbg ("Enrolling finger id %d (%s)", finger_id, user_id);
+
+        g_object_set (print, "fpi-data", data, NULL);
+        g_object_set (print, "description", user_id, NULL);
+
+        g_set_object (&vdev->enrolled_print, print);
+        break;
+      }
+
+    case FPI_DEVICE_ACTION_VERIFY:
+      {
+        g_autoptr(GVariant) data = NULL;
+        FpPrint *print;
+        const char *user_id;
+        guint matched_finger_id;
+        guint finger_id;
+
+        if (vdev->match_result != FPI_MATCH_SUCCESS)
+          {
+            fpi_device_verify_report (dev, vdev->match_result, NULL, NULL);
+            return;
+          }
+
+        fpi_device_get_verify_data (dev, &print);
+        g_object_get (print, "fpi-data", &data, NULL);
+        g_variant_get (data, "(u&s)", &finger_id, &user_id);
+
+        g_assert_true (vdev->buffer_length > 3);
+        matched_finger_id = vdev->buffer[2];
+
+        if (matched_finger_id != finger_id)
+          vdev->match_result = FPI_MATCH_FAIL;
+
+        fp_dbg ("Verifing template for finger id %d (%s): %s", finger_id, user_id,
+                vdev->match_result == FPI_MATCH_SUCCESS ? "match" : "no-match");
+
+        fpi_device_verify_report (dev, vdev->match_result, NULL, NULL);
+        break;
+      }
+
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      {
+        gint i;
+        GPtrArray *templates;
+        FpPrint *identified = NULL;
+        guint matched_finger_id;
+        gboolean have_image_prints;
+
+        fpi_device_get_identify_data (dev, &templates);
+
+        have_image_prints = FALSE;
+        if (fp_device_supports_capture (dev))
+          {
+            for (i = 0; i < templates->len; i++)
+              {
+                FpPrint *template = g_ptr_array_index (templates, i);
+
+                if (!fp_print_get_device_stored (template))
+                  {
+                    have_image_prints = TRUE;
+                    break;
+                  }
+              }
+          }
+
+        if (vdev->match_result != FPI_MATCH_SUCCESS)
+          {
+            if (have_image_prints)
+              {
+                /* The gallery contains other prints that are not stored in
+                 * device, so we need to fallback to image analisys for them */
+                fp_dbg ("Chip verification failed, falling back to host matching");
+                return;
+              }
+
+            /* The identification gallery has no other valid prints, so we can
+             * just stop early without bothering the image check, if any,
+             * thus we set the local match result as success, so that we can
+             * stop further checks */
+            fp_dbg ("Chip verification failed");
+            fpi_device_identify_report (dev, NULL, NULL, NULL);
+            vdev->match_result = FPI_MATCH_SUCCESS;
+            return;
+          }
+
+        g_assert_true (vdev->buffer_length > 3);
+        matched_finger_id = vdev->buffer[2];
+
+        for (i = 0; i < templates->len; i++)
+          {
+            FpPrint *template = g_ptr_array_index (templates, i);
+            GVariant *data;
+            const char *user_id;
+            guint finger_id;
+
+            if (!fp_print_get_device_stored (template))
+              continue;
+
+            g_object_get (template, "fpi-data", &data, NULL);
+            g_variant_get (data, "(u&s)", &finger_id, &user_id);
+
+            if (matched_finger_id == finger_id)
+              {
+                identified = template;
+                break;
+              }
+          }
+
+        vdev->match_result = identified ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+        if (vdev->match_result == FPI_MATCH_FAIL && have_image_prints)
+          {
+            /* The gallery contains other prints that are not stored in
+             * device, so we need to fallback to image analisys for them */
+            fp_dbg ("Chip verification failed, falling back to host matching");
+            return;
+          }
+
+        fpi_device_identify_report (dev, identified, NULL, NULL);
+        fp_dbg ("Identifying finger id %d: %s", matched_finger_id,
+                vdev->match_result == FPI_MATCH_SUCCESS ? "match" : "no-match");
+
+        /* The identification gallery has no other valid prints, so we can
+         * just stop early without bothering the image check, if any,
+         * thus we set the local match result as success, so that we can
+         * stop further checks */
+        vdev->match_result = FPI_MATCH_SUCCESS;
+        break;
+      }
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+static void
+send_db_check_sequence (FpiDeviceVfs0090 *vdev, FpiSsm *ssm, int sequence)
+{
+  do_data_exchange (vdev, ssm, &DB_IDENTIFY_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+}
+
+static void
+finger_db_check_ssm (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  GError *error = NULL;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case DB_CHECK_STATE_1:
+    case DB_CHECK_STATE_2:
+      send_db_check_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - DB_CHECK_STATE_1);
+      break;
+
+    case DB_CHECK_STATE_MATCH_RESULT_WAIT:
+      async_read_from_usb (dev, FP_TRANSFER_INTERRUPT,
+                           vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
+                           finger_scan_interrupt_callback, ssm);
+      break;
+
+    case DB_CHECK_STATE_MATCH_SUCCESS:
+      handle_db_match_reply (vdev, FPI_MATCH_SUCCESS);
+      fpi_ssm_jump_to_state (ssm, DB_CHECK_STATE_MATCH_CHECK_RESULT);
+      break;
+
+    case DB_CHECK_STATE_MATCH_FAILED:
+      handle_db_match_reply (vdev, FPI_MATCH_FAIL);
+      fpi_ssm_jump_to_state (ssm, DB_CHECK_STATE_MATCH_CHECK_RESULT);
+      break;
+
+    case DB_CHECK_STATE_MATCH_CHECK_RESULT:
+      if (scan_action_succeeded (vdev))
+        {
+          fpi_ssm_jump_to_state (ssm, DB_CHECK_STATE_GREEN_LED_BLINK);
+        }
+      else
+        {
+          if (finger_db_check_fallbacks_to_image (vdev))
+            fpi_ssm_mark_completed (ssm);
+          else
+            fpi_ssm_jump_to_state (ssm, DB_CHECK_STATE_RED_LED_BLINK);
+        }
+
+      break;
+
+    case DB_CHECK_STATE_GREEN_LED_BLINK:
+      async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED,
+                           LED_GREEN_BLINK, G_N_ELEMENTS (LED_GREEN_BLINK),
+                           vdev->buffer, VFS_USB_BUFFER_SIZE,
+                           led_blink_callback_with_ssm, ssm);
+
+      break;
+
+
+    case DB_CHECK_STATE_RED_LED_BLINK:
+      async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED,
+                           LED_RED_BLINK, G_N_ELEMENTS (LED_RED_BLINK),
+                           vdev->buffer, VFS_USB_BUFFER_SIZE,
+                           led_blink_callback_with_ssm, ssm);
+      break;
+
+    case DB_CHECK_STATE_AFTER_GREEN_LED_BLINK:
+    case DB_CHECK_STATE_AFTER_RED_LED_BLINK:
+      fpi_ssm_jump_to_state (ssm, DB_CHECK_STATE_SUBMIT_RESULT);
+      break;
+
+    case DB_CHECK_STATE_SUBMIT_RESULT:
+      restart_scan_or_deactivate (vdev);
+      fpi_ssm_next_state (ssm);
+      break;
+
+    default:
+      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                        "Unknown db check state %d",
+                                        fpi_ssm_get_cur_state (ssm));
+      fpi_ssm_mark_failed (ssm, error);
+    }
+}
+
+static void
+start_finger_db_check_subsm (FpDevice *dev, FpiSsm *parent_ssm)
+{
+  FpiSsm *ssm;
+
+  ssm = fpi_ssm_new (dev, finger_db_check_ssm, DB_CHECK_STATE_LAST);
+  fpi_ssm_set_data (ssm, parent_ssm, NULL);
+
+  fpi_ssm_start (ssm, finger_db_check_callback);
+}
+
 typedef struct _VfsImageDownload
 {
   FpiSsm       *parent_ssm;
@@ -1606,18 +1990,6 @@ finger_image_download_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 
       fpi_ssm_mark_failed (imgdown->parent_ssm, error);
     }
-}
-
-static void
-restart_scan_or_deactivate (FpiDeviceVfs0090 *vdev)
-{
-  FpDevice *dev = FP_DEVICE (vdev);
-
-  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
-      vdev->enroll_stage < fp_device_get_nr_enroll_stages (dev))
-    start_reactivate_ssm (dev);
-  else
-    dev_deactivate (dev);
 }
 
 typedef struct _VfsMinutiaeDetection
@@ -1694,6 +2066,9 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
 
         if (print)
           {
+            if (vdev->enroll_stage == 0)
+              fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
+
             fpi_print_add_print (enroll_print, print);
             vdev->enroll_stage += 1;
           }
@@ -1738,6 +2113,9 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
         for (i = 0; !error && i < templates->len; i++)
           {
             FpPrint *template = g_ptr_array_index (templates, i);
+
+            if (fp_print_get_device_stored (template))
+              continue;
 
             if (fpi_print_bz3_match (template, print, VFS_BZ3_THRESHOLD, &error) == FPI_MATCH_SUCCESS)
               {
@@ -1821,6 +2199,46 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
   fpi_ssm_next_state (ssm);
 }
 
+static gboolean
+use_database_matching (FpDevice *dev)
+{
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  FpPrint *print;
+
+  if (!vdev->db_has_prints)
+    return FALSE;
+
+  switch (fpi_device_get_current_action (dev))
+    {
+    case FPI_DEVICE_ACTION_ENROLL:
+      return TRUE;
+
+    case FPI_DEVICE_ACTION_VERIFY:
+      fpi_device_get_verify_data (dev, &print);
+      return fp_print_get_device_stored (print);
+
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      {
+        unsigned int i;
+        GPtrArray *templates;
+
+        fpi_device_get_identify_data (dev, &templates);
+        for (i = 0; i < templates->len; i++)
+          {
+            print = g_ptr_array_index (templates, i);
+
+            if (fp_print_get_device_stored (print))
+              return TRUE;
+          }
+
+        return FALSE;
+      }
+
+    default:
+      return FALSE;
+    }
+}
+
 static void
 finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 {
@@ -1849,14 +2267,17 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 
 
     case IMAGE_DOWNLOAD_STATE_SUBMIT_IMAGE:
-      finger_image_submit (dev, imgdown, ssm);
+      if (use_database_matching (dev))
+        start_finger_db_check_subsm (dev, ssm);
+      else
+        finger_image_submit (dev, imgdown, ssm);
       break;
 
     case IMAGE_DOWNLOAD_STATE_CHECK_RESULT:
-      if (vdev->action_error || vdev->match_result != FPI_MATCH_SUCCESS)
-        fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
-      else
+      if (scan_action_succeeded (vdev))
         fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_GREEN_LED_BLINK);
+      else
+        fpi_ssm_jump_to_state (ssm, IMAGE_DOWNLOAD_STATE_RED_LED_BLINK);
 
       break;
 
@@ -2081,7 +2502,10 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_STATE_SUCCESS:
-      start_finger_image_download_subsm (dev, ssm);
+      if (fp_device_supports_capture (dev))
+        start_finger_image_download_subsm (dev, ssm);
+      else
+        start_finger_db_check_subsm (dev, ssm);
       break;
 
     default:
@@ -2152,6 +2576,42 @@ activate_ssm (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case ACTIVATE_STATE_CHECK_DB:
+
+      if (!vdev->db_checked)
+        {
+          fp_dbg ("Checking internal database for previously saved fingers");
+
+          async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED,
+                               DB_DUMP_STGWINDSOR,
+                               G_N_ELEMENTS (DB_DUMP_STGWINDSOR),
+                               vdev->buffer, VFS_USB_BUFFER_SIZE,
+                               async_transfer_callback_with_ssm, ssm);
+        }
+      else
+        {
+          fpi_ssm_jump_to_state (ssm, ACTIVATE_STATE_GREEN_LED_ON);
+        }
+      break;
+
+    case ACTIVATE_STATE_CHECK_DB_DONE:
+      vdev->db_checked = TRUE;
+
+      if (vdev->buffer_length > 4 &&
+          vdev->buffer[0] == 0x00 && vdev->buffer[1] == 0x00)
+        {
+          fp_dbg ("Enrolled fingers found in the internal memory");
+          vdev->db_has_prints = TRUE;
+        }
+      else
+        {
+          fp_dbg ("No enrolled fingers found in the internal memory");
+          vdev->db_has_prints = FALSE;
+        }
+
+      fpi_ssm_next_state (ssm);
+      break;
+
     case ACTIVATE_STATE_GREEN_LED_ON:
       async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED,
                            LED_GREEN_ON, G_N_ELEMENTS (LED_GREEN_ON),
@@ -2211,13 +2671,7 @@ dev_activate (FpDevice *dev)
   FpiSsm *ssm;
   FpiDeviceAction action = fpi_device_get_current_action (dev);
 
-  if (action == FPI_DEVICE_ACTION_ENROLL)
-    {
-      FpPrint *enroll_print;
-      fpi_device_get_enroll_data (dev, &enroll_print);
-      fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
-    }
-  else if (action == FPI_DEVICE_ACTION_CAPTURE)
+  if (action == FPI_DEVICE_ACTION_CAPTURE)
     {
       gboolean wait_for_finger;
 

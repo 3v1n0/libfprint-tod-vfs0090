@@ -1290,6 +1290,7 @@ translate_interrupt (unsigned char *interrupt, int interrupt_size, GError **erro
   const unsigned char db_identified_prefix[] = { 0x03, 0x00 };
   const unsigned char db_unidentified_prefix[] = { 0x04, 0x00 };
   const unsigned char db_checked_sufix[] = { 0x00, 0xdb };
+  const unsigned char db_check_error[] = { 0x05, 0x00, 0xb3, 0x04, 0xdb };
   const unsigned char low_quality_scan[] = { 0x03, 0x42, 0x04, 0x00, 0x40 };
   const unsigned char scan_failed_too_short[] = { 0x03, 0x60, 0x07, 0x00, 0x40 };
   const unsigned char scan_failed_too_short2[] = { 0x03, 0x61, 0x07, 0x00, 0x41 };
@@ -1355,7 +1356,14 @@ translate_interrupt (unsigned char *interrupt, int interrupt_size, GError **erro
               interrupt + interrupt_size - sizeof (db_checked_sufix),
               sizeof (db_checked_sufix)) == 0)
     {
-      fp_info ("Finger DB identification falied");
+      fp_info ("Finger DB identification failed");
+      return VFS_SCAN_DB_MATCH_FAILED;
+    }
+
+  if (sizeof (db_check_error) == interrupt_size &&
+      memcmp (db_check_error, interrupt, interrupt_size) == 0)
+    {
+      fp_info ("Finger DB check error");
       return VFS_SCAN_DB_MATCH_FAILED;
     }
 

@@ -199,6 +199,28 @@ typedef struct __attribute__((__packed__))
   guint16 status;
 } VfsReply;
 
+typedef struct __attribute__((__packed__))
+{
+  VfsReply msg;
+  guint32 data_size;
+  unsigned char image_data[VFS_IMAGE_SIZE];
+} Vfs0090ImageChunk;
+
+typedef struct __attribute__((__packed__))
+{
+  VfsReply msg;
+  guint32 data_size;
+  guint16 width;
+  guint16 height;
+  guint16 unknown;
+  struct __attribute__((__packed__))
+  {
+    guint16 bit_per_pixels;
+    guint32 error;
+    unsigned char image_data[VFS_IMAGE_SIZE];
+  } image;
+} Vfs0090ImageReply;
+
 const unsigned char TEST_SEED[] = "VirtualBox\0" "0";
 
 static const unsigned char INIT_SEQUENCE_MSG1[] = { 0x01 };

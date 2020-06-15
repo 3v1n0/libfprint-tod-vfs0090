@@ -2254,8 +2254,8 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
   FpiSsm *ssm = data;
   VfsImageDownload *imgdown = fpi_ssm_get_data (ssm);
-  int offset = (fpi_ssm_get_cur_state (ssm) == IMAGE_DOWNLOAD_STATE_1) ? 0x12 : 0x06;
-  int data_size = vdev->buffer_length - offset;
+  unsigned char *image_data;
+  guint16 data_size;
 
   if (error)
     {
@@ -2263,13 +2263,56 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
       fpi_ssm_mark_failed (ssm, error);
       return;
     }
-  else if (data_size < 100)
+  else if (!check_validity_reply (vdev, &error))
     {
-      fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
+      fpi_ssm_mark_failed (ssm, error);
       return;
     }
 
-  memcpy (imgdown->image + imgdown->image_size, vdev->buffer + offset, data_size);
+  if (fpi_ssm_get_cur_state (ssm) == IMAGE_DOWNLOAD_STATE_1)
+    {
+      Vfs0090ImageReply *img_reply = (Vfs0090ImageReply *) vdev->buffer;
+
+      image_data = img_reply->image.image_data;
+      data_size = img_reply->data_size - G_STRUCT_OFFSET (Vfs0090ImageReply, image);
+
+      if (img_reply->width != VFS_IMAGE_SIZE || img_reply->height != VFS_IMAGE_SIZE)
+        {
+          fpi_ssm_mark_failed (ssm,
+                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                         "Unexpected image size"));
+          return;
+        }
+
+      if (img_reply->image.error)
+        {
+          fpi_ssm_mark_failed (ssm,
+                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                         "Image capture failed"));
+          return;
+        }
+
+      fp_dbg ("Got image of %dx%d, %d bit per pixel", img_reply->width,
+              img_reply->height, img_reply->image.bit_per_pixels);
+    }
+  else
+    {
+      Vfs0090ImageChunk *img_chunk = (Vfs0090ImageChunk *) vdev->buffer;
+
+      image_data = img_chunk->image_data;
+      data_size = img_chunk->data_size;
+    }
+
+  if (image_data + data_size != vdev->buffer + vdev->buffer_length)
+    {
+      fpi_ssm_mark_failed (ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                     "Expected image data size mismatch"));
+      return;
+    }
+
+  fp_dbg ("Getting %d bytes of image data", data_size);
+  memcpy (imgdown->image + imgdown->image_size, image_data, data_size);
   imgdown->image_size += data_size;
 
   fpi_ssm_next_state (ssm);

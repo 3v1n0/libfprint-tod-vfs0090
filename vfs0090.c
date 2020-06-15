@@ -2872,6 +2872,9 @@ dev_deactivate_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       switch (fpi_device_get_current_action (dev))
         {
+        case FPI_DEVICE_ACTION_NONE:
+          break;
+
         case FPI_DEVICE_ACTION_ENROLL:
           fpi_device_enroll_complete (dev,
                                       g_steal_pointer (&vdev->enrolled_print),

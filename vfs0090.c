@@ -1757,9 +1757,9 @@ handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
     case FPI_DEVICE_ACTION_ENROLL:
       {
         g_autofree gchar *user_id = NULL;
+        VfsDbIdentifyInterrupt *identification;
         FpPrint *print;
         GVariant *data;
-        guint finger_id;
 
         if (vdev->match_result != FPI_MATCH_SUCCESS)
           {
@@ -1790,17 +1790,17 @@ handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
                                         NULL, NULL);
           }
 
-        g_assert_true (vdev->buffer_length > 3);
-        finger_id = vdev->buffer[2];
+        g_assert_true (vdev->buffer_length == sizeof (VfsDbIdentifyInterrupt));
+        identification = ((VfsDbIdentifyInterrupt *) (vdev->buffer));
 
         fpi_device_get_enroll_data (dev, &print);
         user_id = _fpi_print_generate_user_id (print);
-        data = g_variant_new ("(us)", finger_id, user_id);
+        data = g_variant_new ("(us)", identification->finger_id, user_id);
 
         fpi_print_set_type (print, FPI_PRINT_RAW);
         fpi_print_set_device_stored (print, TRUE);
 
-        fp_dbg ("Enrolling finger id %d (%s)", finger_id, user_id);
+        fp_dbg ("Enrolling finger id %d (%s)", identification->finger_id, user_id);
 
         g_object_set (print, "fpi-data", data, NULL);
         g_object_set (print, "description", user_id, NULL);

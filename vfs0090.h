@@ -221,6 +221,22 @@ typedef struct __attribute__((__packed__))
   } image;
 } Vfs0090ImageReply;
 
+typedef struct __attribute__((__packed__))
+{
+  guint8 request_id;
+  const guint8 unknowns1[2];
+  guint16 storage_id;
+  guint16 user_id;
+  guint16 unknowns2[3];
+} VfsDbIdentifyQuery;
+
+typedef struct __attribute__((__packed__))
+{
+  guint16 reply_id;
+  guint16 finger_id;
+  guint8 db;
+} VfsDbIdentifyInterrupt;
+
 const unsigned char TEST_SEED[] = "VirtualBox\0" "0";
 
 static const unsigned char INIT_SEQUENCE_MSG1[] = { 0x01 };
@@ -755,13 +771,14 @@ static const unsigned char DB_DUMP_STGWINDSOR[] = {
 
 static const VfsDataExchange DB_IDENTIFY_SEQUENCES[] = {
   {
-    .msg = (unsigned char[]){
-      0x5e, 0x02, 0xff,
-      0x00, 0x00, /* Any storage */
-      0x00, 0x00, /* Any user id */
-      0x01, 0x00, 0x00, 0x00, 0x00, 0x00
-    },
-    .msg_length = 13,
+    .msg = (unsigned char *) &((VfsDbIdentifyQuery){
+      .request_id = 0x5e,
+      .unknowns1 = { 0x02, 0xff },
+      .storage_id = 0,
+      .user_id = 0,
+      .unknowns2 = { 1, 0, 0 },
+    }),
+    .msg_length = sizeof (VfsDbIdentifyQuery),
     .rsp = (unsigned char[]){ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
     .rsp_length = 6,
   },

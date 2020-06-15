@@ -194,6 +194,11 @@ typedef struct _VfsDataExchange
   int                  rsp_length;
 } VfsDataExchange;
 
+typedef struct __attribute__((__packed__))
+{
+  guint16 status;
+} VfsReply;
+
 const unsigned char TEST_SEED[] = "VirtualBox\0" "0";
 
 static const unsigned char INIT_SEQUENCE_MSG1[] = { 0x01 };

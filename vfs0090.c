@@ -374,6 +374,24 @@ async_write_encrypted_to_usb (FpDevice              *dev,
                       async_write_encrypted_callback, enc_op);
 }
 
+static gboolean
+check_validity_reply (FpiDeviceVfs0090 *vdev, GError **error)
+{
+  VfsReply *reply = (VfsReply *) vdev->buffer;
+
+  if (reply->status != 0)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "Validity replied with an error status: 0x%02x",
+                   reply->status);
+      fp_err ("Unexpected reply status 0x%02x", reply->status);
+
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
 static void
 async_read_encrypted_callback (FpiUsbTransfer *transfer, FpDevice *dev,
                                gpointer data, GError *error)
@@ -394,6 +412,9 @@ async_read_encrypted_callback (FpiUsbTransfer *transfer, FpDevice *dev,
                                         "Impossible to decrypt "
                                         "received data");
     }
+
+  if (!error)
+    check_validity_reply (vdev, &error);
 
   if (enc_op->callback)
     enc_op->callback (transfer, dev, enc_op->callback_data, error);

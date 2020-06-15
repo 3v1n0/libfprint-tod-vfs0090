@@ -2139,6 +2139,10 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
         else
           vdev->match_result = FPI_MATCH_ERROR;
 
+        fp_dbg ("Verified finger %d minutiae: %s",
+                fp_print_get_finger (print),
+                vdev->match_result == FPI_MATCH_SUCCESS ? "match" : "no-match");
+
         if (!error || error->domain == FP_DEVICE_RETRY)
           fpi_device_verify_report (dev, vdev->match_result,
                                     g_steal_pointer (&print),
@@ -2169,6 +2173,8 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
                 break;
               }
           }
+
+        fp_dbg ("Identified finger minutiae: %s", result ? "match" : "no-match");
 
         if (!error || error->domain == FP_DEVICE_RETRY)
           fpi_device_identify_report (dev, result, g_steal_pointer (&print),

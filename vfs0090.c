@@ -1927,9 +1927,8 @@ finger_db_check_ssm (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case DB_CHECK_STATE_1:
-    case DB_CHECK_STATE_2:
-      send_db_check_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - DB_CHECK_STATE_1);
+    case DB_CHECK_STATE_REQUEST:
+      send_db_check_sequence (vdev, ssm, 0);
       break;
 
     case DB_CHECK_STATE_MATCH_RESULT_WAIT:
@@ -1940,6 +1939,10 @@ finger_db_check_ssm (FpiSsm *ssm, FpDevice *dev)
 
     case DB_CHECK_STATE_MATCH_SUCCESS:
       handle_db_match_reply (vdev, FPI_MATCH_SUCCESS);
+      send_db_check_sequence (vdev, ssm, 1);
+      break;
+
+    case DB_CHECK_STATE_MATCH_SUCCESS_DETAILS:
       fpi_ssm_jump_to_state (ssm, DB_CHECK_STATE_MATCH_CHECK_RESULT);
       break;
 
@@ -2764,7 +2767,6 @@ deactivate_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case DEACTIVATE_STATE_SEQ_1:
-    case DEACTIVATE_STATE_SEQ_2:
       send_deactivate_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - DEACTIVATE_STATE_SEQ_1);
       break;
 

@@ -100,8 +100,8 @@ enum SCAN_STATES {
   SCAN_STATE_SUCCESS,
   SCAN_STATE_SUCCESS_LOW_QUALITY,
   SCAN_STATE_DB_MATCH_RESULT_WAIT,
-  SCAN_STATE_DB_MATCH_SUCCESS,
   SCAN_STATE_DB_MATCH_FAILED,
+  SCAN_STATE_DB_MATCH_SUCCESS,
 
   SCAN_STATE_LAST
 };
@@ -116,20 +116,20 @@ enum VFS_SCAN_INTERRUPTS {
   VFS_SCAN_COMPLETED,
   VFS_SCAN_SUCCESS,
   VFS_SCAN_SUCCESS_LOW_QUALITY,
-  VFS_SCAN_DB_MATCH_SUCCESS,
   VFS_SCAN_DB_MATCH_FAILED,
+  VFS_SCAN_DB_MATCH_SUCCESS,
 
   VFS_SCAN_UNKNOWN = 100,
 };
 
 /* Move downnn */
 enum DB_CHECK_STATES {
-  DB_CHECK_STATE_1,
-  DB_CHECK_STATE_2,
+  DB_CHECK_STATE_REQUEST,
   DB_CHECK_STATE_MATCH_RESULT_WAIT,
 
-  DB_CHECK_STATE_MATCH_SUCCESS = VFS_SCAN_DB_MATCH_SUCCESS,
   DB_CHECK_STATE_MATCH_FAILED = VFS_SCAN_DB_MATCH_FAILED,
+  DB_CHECK_STATE_MATCH_SUCCESS = VFS_SCAN_DB_MATCH_SUCCESS,
+  DB_CHECK_STATE_MATCH_SUCCESS_DETAILS,
 
   DB_CHECK_STATE_MATCH_CHECK_RESULT,
   DB_CHECK_STATE_GREEN_LED_BLINK,
@@ -166,7 +166,6 @@ enum IMAGE_DOWNLOAD_STATES {
 enum DEACTIVATE_STATES {
   DEACTIVATE_STOP_TRANSFER,
   DEACTIVATE_STATE_SEQ_1,
-  DEACTIVATE_STATE_SEQ_2,
   DEACTIVATE_STATE_LED_OFF,
 
   DEACTIVATE_STATE_LAST
@@ -736,24 +735,18 @@ static const VfsDataExchange DB_IDENTIFY_SEQUENCES[] = {
       0x01, 0x00, 0x00, 0x00, 0x00, 0x00
     },
     .msg_length = 13,
-    .rsp = NULL,
-    .rsp_length = -1,
+    .rsp = (unsigned char[]){ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .rsp_length = 6,
   },
   {
-    .msg = DB_DUMP_STGWINDSOR,
-    .msg_length = sizeof(DB_DUMP_STGWINDSOR),
-    .rsp = NULL,
+    .msg = (unsigned char[]){ 0x60, 0x00, 0x00, 0x00, 0x00 },
+    .msg_length = 5,
+    /* The response here contains the details on database matching */
     .rsp_length = -1,
   },
 };
 
 static const VfsDataExchange DEACTIVATE_SEQUENCES[] = {
-  {
-    .msg = (unsigned char[]){ 0x60, 0x00, 0x00, 0x00, 0x00 },
-    .msg_length = 5,
-    .rsp = (unsigned char[]){ 0xf5, 0x04 },
-    .rsp_length = -1,             /* 2 or 69 */
-  },
   {
     .msg = (unsigned char[]){ 0x62, 0x00, 0x00, 0x00, 0x00 },
     .msg_length = 5,

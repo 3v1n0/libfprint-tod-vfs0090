@@ -18,7 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define FP_COMPONENT "vfs0090"
+#define FP_COMPONENT "vfs009x"
 
 #include "drivers_api.h"
 
@@ -1652,6 +1652,15 @@ restart_scan_or_deactivate (FpiDeviceVfs0090 *vdev)
 }
 
 static gboolean
+vfs_device_supports_capture (FpDevice *dev)
+{
+  if (!fp_device_supports_capture (dev))
+    return FALSE;
+
+  return fpi_device_get_driver_data (dev) == FPI_DEVICE_ACTION_CAPTURE;
+}
+
+static gboolean
 scan_action_succeeded (FpiDeviceVfs0090 *vdev)
 {
   return !vdev->action_error && vdev->match_result == FPI_MATCH_SUCCESS;
@@ -1663,7 +1672,7 @@ finger_db_check_fallbacks_to_image (FpiDeviceVfs0090 *vdev)
   FpDevice *dev = FP_DEVICE (vdev);
   FpiDeviceAction action;
 
-  if (!fp_device_supports_capture (dev))
+  if (!vfs_device_supports_capture (dev))
     return FALSE;
 
   if (scan_action_succeeded (vdev))
@@ -1765,7 +1774,7 @@ handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
           {
             fp_dbg ("Finger doesn't match any enrolled finger in DB");
 
-            if (fp_device_supports_capture (dev))
+            if (vfs_device_supports_capture (dev))
               /* Returning here will cause fallig back to image enrolling  */
               return;
 
@@ -1851,7 +1860,7 @@ handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
         fpi_device_get_identify_data (dev, &templates);
 
         have_image_prints = FALSE;
-        if (fp_device_supports_capture (dev))
+        if (vfs_device_supports_capture (dev))
           {
             for (i = 0; i < templates->len; i++)
               {
@@ -2228,6 +2237,7 @@ finger_image_submit (FpDevice         *dev,
   img->flags = FPI_IMAGE_H_FLIPPED;
   memcpy (img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 
+#if HAVE_PIXMAN
   if (VFS_IMAGE_RESCALE > 1)
     {
       g_autoptr(FpImage) resized = NULL;
@@ -2235,6 +2245,7 @@ finger_image_submit (FpDevice         *dev,
       resized = fpi_image_resize (img, VFS_IMAGE_RESCALE, VFS_IMAGE_RESCALE);
       g_set_object (&img, resized);
     }
+#endif
 
   minutiae_data = g_new0 (VfsMinutiaeDetection, 1);
   minutiae_data->dev = dev;
@@ -2621,7 +2632,7 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_STATE_SUCCESS:
-      if (fp_device_supports_capture (dev))
+      if (vfs_device_supports_capture (dev))
         start_finger_image_download_subsm (dev, ssm);
       else
         start_finger_db_check_subsm (dev, ssm);
@@ -2793,6 +2804,13 @@ dev_activate (FpDevice *dev)
   if (action == FPI_DEVICE_ACTION_CAPTURE)
     {
       gboolean wait_for_finger;
+
+      if (!vfs_device_supports_capture (dev))
+        {
+          fpi_device_action_error (dev,
+                                   fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+          return;
+        }
 
       fpi_device_get_capture_data (dev, &wait_for_finger);
 
@@ -3088,13 +3106,18 @@ dev_cancel (FpDevice *dev)
 
 /* Usb id table of device */
 static const FpIdEntry id_table[] = {
-  { .vid = 0x138a, .pid = 0x0090 },
+  { .vid = 0x138a, .pid = 0x0090, .driver_data = FPI_DEVICE_ACTION_CAPTURE },
+  { .vid = 0x138a, .pid = 0x0097, .driver_data = FPI_DEVICE_ACTION_NONE },
   { .vid = 0,  .pid = 0, .driver_data = 0 },
 };
 
 static void
-fpi_device_vfs0090_init (FpiDeviceVfs0090 *self)
+fpi_device_vfs0090_init (FpiDeviceVfs0090 *vdev)
 {
+  FpDevice *dev = FP_DEVICE (vdev);
+
+  if (!vfs_device_supports_capture (dev))
+    fpi_device_set_nr_enroll_stages (dev, 1);
 }
 
 static void

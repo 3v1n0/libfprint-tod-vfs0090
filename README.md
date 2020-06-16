@@ -1,9 +1,9 @@
-## Validity Sensor `138a:0090` libfprint driver
+## Validity Sensor `138a:0090` and `138a:0097` libfprint driver
 #### A linux driver for 2016 ThinkPad's fingerprint readers
 
 [![See it in action!](https://img.youtube.com/vi/dYe8eKaoUSE/0.jpg)](https://www.youtube.com/watch?v=dYe8eKaoUSE)`
 
-Thanks to the amazing work that [nmikhailov](https://github.com/nmikhailov) did in his [prototype](https://github.com/nmikhailov/Validity90/) and [uunicorn](https://github.com/uunicorn/) in [python-validity](https://github.com/uunicorn/python-validity) and [synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox), I spent some time in getting a libfprint driver for the `138a:0090` device up...
+Thanks to the amazing work that [nmikhailov](https://github.com/nmikhailov) did in his [prototype](https://github.com/nmikhailov/Validity90/) and [uunicorn](https://github.com/uunicorn/) in [python-validity](https://github.com/uunicorn/python-validity) and [synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox), I spent some time in getting a libfprint driver for the `138a:0090` (and `138a:0097`) device up...
 
  * It only works if the device has been initialized using [validity-sensors-tools/](https://snapcraft.io/validity-sensors-tools/)
    - Alernatively, but it's less secure, you can use a Windows installation with VirtualBox (sharing USB) guest or with a Windows installation in bare metal
@@ -30,11 +30,21 @@ sudo validity-sensors-tools.initializer
 # Test the device
 sudo validity-sensors-tools.led_test
 
-# See other avilable tools
+# This is needed and only works in 138a:0097:
+sudo validity-sensors-tools.enroll --finger-id [0-9]
+
+# See other available tools
 validity-sensors-tools --help
 ```
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/validity-sensors-tools)
+
+#### Match on Chip
+
+This is the only supported way by `138a:0097`, so once you've enrolled your fingers with `validity-sensors-tools.enroll` you will be able to re-enroll your fingers in fprintd to use them in linux as well.
+
+This unfortunately can't be done in `138a:0090`, but you can still use a Windows installation (even in VirtualBox) to enroll the prints to save them in the chip and enable the match-on-sensor, this can make the verification faster, safer and higher quality.<br />
+Unfortunately there's currently no easy way to implement this in this driver without reverse-engineer the fingerprint template creation that the windows drivers does in host.
 
 #### Ubuntu installation
 
@@ -49,7 +59,7 @@ sudo snap install validity-sensors-tools
 sudo snap connect validity-sensors-tools:raw-usb
 sudo validity-sensors-tools.initializer
 
-# Add the repository and install the tod package
+# Add the repository and install the tod package (supports both chips)
 sudo add-apt-repository -u ppa:3v1n0/libfprint-vfs0090
 sudo apt install libfprint-2-tod-vfs0090
 ```
@@ -67,6 +77,12 @@ for finger in {left,right}-{thumb,{index,middle,ring,little}-finger}; do fprintd
 ```
 
 #### Help testing
+
+##### `138a:0097`
+
+I've no hardware using that device, so any help is appreciated.
+
+##### `138a:0090`
 
 It would be nice if you could help in tuning the value of the `bz3_threshold`, as that's the value that defines how different should be the prints, and so it's important for having better security. I've set it to `12` currently, but of course increasing the number of prints we enroll or the image quality that could be increased.
 

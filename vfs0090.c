@@ -1774,7 +1774,7 @@ handle_db_match_reply (FpiDeviceVfs0090 *vdev, FpiMatchResult result)
             vdev->action_error =
               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
                                         "This device currently only supports enrolling fingers " \
-                                        "that have been previously enrolled using external tools" \
+                                        "that have been previously enrolled using external " \
                                         "tools, use validity-sensors-tools, available at " \
                                         "https://snapcraft.io/validity-sensors-tools\n" \
                                         "Otherwise it's possible to use a VirtualBox VM running "

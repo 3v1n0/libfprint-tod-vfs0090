@@ -1,8 +1,8 @@
-libfprint-2-tod-vfs0090 (0.96.91~f1) UNRELEASED; urgency=medium
+libfprint-2-tod-vfs0090 (0.96.91~f1) focal; urgency=medium
 
   * Release version with 138a:0097 support (and db-matching for 138a:0090)
 
- -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Tue, 16 Jun 2020 21:35:43 +0200
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Tue, 16 Jun 2020 21:37:47 +0200
 
 libfprint-2-tod-vfs0090 (0.90~f3) focal; urgency=medium
 

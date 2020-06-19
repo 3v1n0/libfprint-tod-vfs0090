@@ -4,15 +4,8 @@ Priority: optional
 Maintainer: Marco Trevisan (Treviño) <marco@ubuntu.com>
 Build-Depends: debhelper-compat (= 12),
                libfprint-2-tod-dev,
-               libfprint-2-dev,
-               libglib2.0-dev,
-               libgusb-dev,
-               libpixman-1-dev,
                libssl-dev,
-               libnss3-dev,
-               libusb-1.0-0-dev,
                meson,
-               pkg-config,
                udev
 Standards-Version: 4.4.1
 Homepage: https://gitlab.freedesktop.org/3v1n0/libfprint-tod-vfs0090/

@@ -1,21 +1,23 @@
-## Validity Sensor `138a:0090` and `138a:0097` libfprint driver
-#### A linux driver for 2016 ThinkPad's fingerprint readers
+## Validity Sensor `138a:0090`, `138a:0097`, and `06cb:009a` libfprint driver
+#### A linux driver for 2016 and 2018 ThinkPad's fingerprint readers
 
 [![See it in action!](https://img.youtube.com/vi/dYe8eKaoUSE/0.jpg)](https://www.youtube.com/watch?v=dYe8eKaoUSE)`
 
-Thanks to the amazing work that [nmikhailov](https://github.com/nmikhailov) did in his [prototype](https://github.com/nmikhailov/Validity90/) and [uunicorn](https://github.com/uunicorn/) in [python-validity](https://github.com/uunicorn/python-validity) and [synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox), I spent some time in getting a libfprint driver for the `138a:0090` (and `138a:0097`) device up...
+Thanks to the amazing work that [nmikhailov](https://github.com/nmikhailov) did in his [prototype](https://github.com/nmikhailov/Validity90/) and [uunicorn](https://github.com/uunicorn/) in [python-validity](https://github.com/uunicorn/python-validity) and [synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox), I spent some time in getting a libfprint driver for the `138a:0090` (and `138a:0097` and `06cb:009a`) device up...
 
- * It only works if the device has been initialized using [validity-sensors-tools/](https://snapcraft.io/validity-sensors-tools/)
+ * It only works if the device has been initialized using [validity-sensors-tools/](https://snapcraft.io/validity-sensors-tools/) or the very recent [work on 009a](https://github.com/uunicorn/python-validity/issues/3)
    - Alernatively, but it's less secure, you can use a Windows installation with VirtualBox (sharing USB) guest or with a Windows installation in bare metal
  * Most of the device interaction and crypto code is coming from the prototype, so basically it needs lots of cleanup, but I hope to rebase this on the code from python-validity
  * Here enroll, verification, led and all the operations work
- * It uses libfprint image comparison algorithm, we might move to in-device check later.
+ * For 0090 it uses libfprint image comparison algorithm, we might move to in-device check later.
+ * For 0097 and 009a it uses in-device check/Match-On-Chip.
 
 You can test it using the [libfprint examples](https://gitlab.freedesktop.org/libfprint/libfprint/-/tree/master/examples) or just using `fprintd-*` tools (GNOME supports it natively from control center).
 
 
 ### Device initialization and pairing
 
+#### 0090 and 0097
 I racommend using the [validity-sensors-tools/](https://snapcraft.io/validity-sensors-tools/), you can install it in any distro as snap, or you can use it manually from sources located in [my python validity fork](https://github.com/3v1n0/python-validity)
 
 ```bash
@@ -39,9 +41,13 @@ validity-sensors-tools --help
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/validity-sensors-tools)
 
+#### 009a 
+
+For now, the best way to initialize is to follow recent instructions in this bug: [uunicorn/python-validity/issues/3](https://github.com/uunicorn/python-validity/issues/3)
+
 #### Match on Chip
 
-This is the only supported way by `138a:0097`, so once you've enrolled your fingers with `validity-sensors-tools.enroll` you will be able to re-enroll your fingers in fprintd to use them in linux as well.
+This is the only supported way by `138a:0097` and `06cb:009a`, so once you've enrolled your fingers with `validity-sensors-tools.enroll` or similar for 009a, you will be able to re-enroll your fingers in fprintd to use them in linux as well.
 
 This unfortunately can't be done in `138a:0090`, but you can still use a Windows installation (even in VirtualBox) to enroll the prints to save them in the chip and enable the match-on-sensor, this can make the verification faster, safer and higher quality.<br />
 Unfortunately there's currently no easy way to implement this in this driver without reverse-engineer the fingerprint template creation that the windows drivers does in host.

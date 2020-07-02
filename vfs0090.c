@@ -3108,6 +3108,7 @@ dev_cancel (FpDevice *dev)
 static const FpIdEntry id_table[] = {
   { .vid = 0x138a, .pid = 0x0090, .driver_data = FPI_DEVICE_ACTION_CAPTURE },
   { .vid = 0x138a, .pid = 0x0097, .driver_data = FPI_DEVICE_ACTION_NONE },
+  { .vid = 0x06cb, .pid = 0x009a, .driver_data = FPI_DEVICE_ACTION_NONE },
   { .vid = 0,  .pid = 0, .driver_data = 0 },
 };
 

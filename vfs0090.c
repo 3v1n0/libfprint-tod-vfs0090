@@ -1629,7 +1629,7 @@ led_blink_callback_with_ssm (FpiUsbTransfer *transfer, FpDevice *dev,
 
   if (!error)
     {
-      fpi_ssm_next_state_delayed (ssm, 200, NULL);
+      fpi_ssm_next_state_delayed (ssm, 200);
     }
   else
     {
@@ -2951,7 +2951,7 @@ reactivate_ssm (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case REACTIVATE_STATE_WAIT:
-      fpi_ssm_next_state_delayed (ssm, 100, NULL);
+      fpi_ssm_next_state_delayed (ssm, 100);
       break;
 
     case REACTIVATE_STATE_DEACTIVATE:

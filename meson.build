@@ -19,6 +19,8 @@ vfs009x_deps += dependency('nss')
 vfs009x_deps += dependency('openssl')
 
 vfs0090_deps += dependency('pixman-1')
+# pixman is required, so enable the image upscale in vfs0090.c (#if HAVE_PIXMAN)
+add_project_arguments('-DHAVE_PIXMAN=1', language: 'c')
 
 shared_module('fprint-tod-vfs009x',
     sources: [

@@ -19,10 +19,14 @@
  */
 
 #define FP_COMPONENT "vfs009x"
+#define _GNU_SOURCE /* O_NOFOLLOW, O_CLOEXEC under c_std=c99 */
 
 #include "drivers_api.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <ctype.h>
 #include <nss.h>
 #include <pk11pub.h>
@@ -49,6 +53,11 @@ struct _FpiDeviceVfs0090
   gboolean deactivating;
   gboolean db_checked;
   gboolean db_has_prints;
+  gboolean host_paired; /* TLS keys from disk; sensor flash not readable */
+  guint    prg_polls;          /* capture program status polls this scan */
+  FpiSsm  *poll_ssm;           /* scan SSM while polling, else NULL */
+  gboolean poll_in_flight;     /* 0x51 status exchange running */
+  gboolean poll_delay_pending; /* delayed re-poll scheduled */
 
   /* Buffer for saving usb data through states */
   unsigned char *buffer;
@@ -334,6 +343,7 @@ typedef struct _VfsAsyncUsbEncryptedOperationData
 
   unsigned char         *encrypted_data;
   int                    encrypted_data_size;
+  gboolean               any_status; /* don't check the reply status word */
 } VfsAsyncUsbEncryptedOperationData;
 
 static void
@@ -413,7 +423,7 @@ async_read_encrypted_callback (FpiUsbTransfer *transfer, FpDevice *dev,
                                         "received data");
     }
 
-  if (!error)
+  if (!error && !enc_op->any_status)
     check_validity_reply (vdev, &error);
 
   if (enc_op->callback)
@@ -427,6 +437,7 @@ async_read_encrypted_callback (FpiUsbTransfer *transfer, FpDevice *dev,
 static void
 async_read_decrypt_from_usb (FpDevice *dev, FpiTransferType transfer_type,
                              unsigned char *buffer, int buffer_size,
+                             gboolean any_status,
                              FpiUsbTransferCallback callback, gpointer callback_data)
 {
   VfsAsyncUsbEncryptedOperationData *enc_op;
@@ -434,6 +445,7 @@ async_read_decrypt_from_usb (FpDevice *dev, FpiTransferType transfer_type,
   enc_op = g_new0 (VfsAsyncUsbEncryptedOperationData, 1);
   enc_op->callback = callback;
   enc_op->callback_data = callback_data;
+  enc_op->any_status = any_status;
 
   async_read_from_usb (dev, transfer_type, buffer, buffer_size,
                        async_read_encrypted_callback, enc_op);
@@ -466,11 +478,13 @@ on_async_data_exchange_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                                dex->buffer_size,
                                dex->callback, dex->callback_data);
         }
-      else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED)
+      else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED ||
+               dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED_ANY_STATUS)
         {
           async_read_decrypt_from_usb (dev, FP_TRANSFER_BULK,
                                        dex->buffer,
                                        dex->buffer_size,
+                                       dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED_ANY_STATUS,
                                        dex->callback,
                                        dex->callback_data);
         }
@@ -501,7 +515,8 @@ async_data_exchange (FpDevice *dev, int exchange_mode,
       async_write_to_usb (dev, data, data_size,
                           on_async_data_exchange_cb, dex);
     }
-  else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED)
+  else if (dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED ||
+           dex->exchange_mode == DATA_EXCHANGE_ENCRYPTED_ANY_STATUS)
     {
       async_write_encrypted_to_usb (dev, data, data_size,
                                     on_async_data_exchange_cb, dex);
@@ -530,48 +545,33 @@ async_transfer_callback_with_ssm (FpiUsbTransfer *transfer, FpDevice *dev,
 static void
 generate_main_seed (FpDevice *dev, VfsInit *vinit)
 {
-  char name[NAME_MAX], serial[NAME_MAX];
+  char name[NAME_MAX + 1], serial[NAME_MAX + 1];
   FILE *name_file, *serial_file;
   int name_len, serial_len;
-  GError *error = NULL;
+  gboolean ok = FALSE;
 
-  if (!(name_file = fopen (DMI_PRODUCT_NAME_NODE, "r")))
+  name_file = fopen (DMI_PRODUCT_NAME_NODE, "r");
+  serial_file = fopen (DMI_PRODUCT_SERIAL_NODE, "r");
+
+  if (name_file && serial_file &&
+      fscanf (name_file, "%" G_STRINGIFY (NAME_MAX) "s", name) == 1 &&
+      fscanf (serial_file, "%" G_STRINGIFY (NAME_MAX) "s", serial) == 1)
+    ok = TRUE;
+
+  if (name_file)
+    fclose (name_file);
+  if (serial_file)
+    fclose (serial_file);
+
+  if (!ok)
     {
-      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
-                                        "Can't open "
-                                        DMI_PRODUCT_NAME_NODE);
-      fp_err ("%s", error->message);
-      fpi_device_action_error (dev, error);
+      /* product_serial is root-only. Same fallback as python-validity, which
+       * wraps the key with this seed when it pairs without root. The ECDSA
+       * key decryption retries with TEST_SEED anyway. */
+      fp_warn ("Can't read DMI product name/serial, using fallback seed");
+      vinit->main_seed_length = sizeof (TEST_SEED);
+      vinit->main_seed = g_memdup2 (TEST_SEED, sizeof (TEST_SEED));
       return;
-    }
-  if (!(serial_file = fopen (DMI_PRODUCT_SERIAL_NODE, "r")))
-    {
-      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_NOT_FOUND,
-                                        "Can't open "
-                                        DMI_PRODUCT_SERIAL_NODE);
-      fp_err ("%s", error->message);
-      fpi_device_action_error (dev, error);
-      goto out_serial;
-    }
-
-  if (fscanf (name_file, "%s", name) != 1)
-    {
-      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
-                                        "Can't parse product name from "
-                                        DMI_PRODUCT_NAME_NODE);
-      fp_err ("%s", error->message);
-      fpi_device_action_error (dev, error);
-      goto out_closeall;
-    }
-
-  if (fscanf (serial_file, "%s", serial) != 1)
-    {
-      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
-                                        "Can't parse product name from "
-                                        DMI_PRODUCT_SERIAL_NODE);
-      fp_err ("%s", error->message);
-      fpi_device_action_error (dev, error);
-      goto out_closeall;
     }
 
   name_len = strlen (name);
@@ -581,11 +581,6 @@ generate_main_seed (FpDevice *dev, VfsInit *vinit)
 
   memcpy (vinit->main_seed, name, name_len + 1);
   memcpy (vinit->main_seed + name_len + 1, serial, serial_len + 1);
-
-out_closeall:
-  fclose (serial_file);
-out_serial:
-  fclose (name_file);
 }
 
 #define usb_operation(func, dev, error_ptr) usb_operation_perform (STRINGIZE (func), func, dev, error_ptr)
@@ -915,6 +910,9 @@ static gboolean
 check_pad (unsigned char *data, int len)
 {
   int pad_size = data[len - 1];
+
+  if (pad_size == 0 || pad_size > 16 || pad_size > len)
+    return FALSE;
 
   for(int i = 0; i < pad_size; ++i)
     if (data[len - 1 - i] != pad_size)
@@ -1418,11 +1416,281 @@ translate_interrupt (unsigned char *interrupt, int interrupt_size, GError **erro
   return VFS_SCAN_UNKNOWN;
 }
 
+/* On host-paired (SGX variant) 138a:0090 sensors the flash is not readable
+ * by the host: 0x43 02 (fwext info) and 0x40 (flash read) both answer with
+ * the 2-byte status 0x04af. Accept any reply length for 0x43 02. */
+static const VfsDataExchange INIT_SEQUENCE_FWINFO_ANY_LEN = {
+  .msg = INIT_SEQUENCE_MSG3,
+  .msg_length = G_N_ELEMENTS (INIT_SEQUENCE_MSG3),
+  .rsp = NULL,
+  .rsp_length = -1,
+};
+
 static void
 send_init_sequence (FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
                     int sequence)
 {
+  if (sequence == INIT_STATE_SEQ_3 - INIT_STATE_SEQ_1)
+    {
+      do_data_exchange (vdev, ssm, &INIT_SEQUENCE_FWINFO_ANY_LEN,
+                        DATA_EXCHANGE_PLAIN);
+      return;
+    }
+
   do_data_exchange (vdev, ssm, &INIT_SEQUENCES[sequence], DATA_EXCHANGE_PLAIN);
+}
+
+static const unsigned char GWK_SIGN[] = {
+  0x3a, 0x4c, 0x76, 0xb7, 0x6a, 0x97, 0x98, 0x1d, 0x12, 0x74, 0x24, 0x7e,
+  0x16, 0x66, 0x10, 0xe7, 0x7f, 0x4d, 0x9c, 0x9d, 0x07, 0xd3, 0xc7, 0x28,
+  0xe5, 0x32, 0x91, 0x6b, 0xdd, 0x28, 0xb4, 0x54
+};
+
+/* python-validity key blob: 0x02 | IV(16) | AES-CBC(0x70) | HMAC(32).
+ * Derive the GWK key from @seed and check the blob HMAC with the
+ * GWK_SIGN validation key, as python-validity tls.handle_priv does. */
+static gboolean
+key_blob_matches_seed (const unsigned char *priv_body,
+                       const unsigned char *seed, int seed_len,
+                       unsigned char *masterkey_out)
+{
+  unsigned char enc_key[VFS_MASTER_KEY_SIZE];
+  unsigned char val_key[0x20];
+  g_autofree unsigned char *mac = NULL;
+  gboolean ok;
+
+  TLS_PRF2 (PRE_KEY, sizeof (PRE_KEY), "GWK", seed, seed_len,
+            enc_key, VFS_MASTER_KEY_SIZE);
+  TLS_PRF2 (enc_key, VFS_MASTER_KEY_SIZE, "GWK_SIGN", GWK_SIGN,
+            sizeof (GWK_SIGN), val_key, sizeof (val_key));
+  mac = hmac_compute (val_key, sizeof (val_key),
+                      (unsigned char *) priv_body + 1, 0x10 + 0x70);
+  ok = memcmp (mac, priv_body + 1 + 0x10 + 0x70, 0x20) == 0;
+
+  if (ok)
+    memcpy (masterkey_out, enc_key, VFS_MASTER_KEY_SIZE);
+
+  explicit_bzero (enc_key, sizeof (enc_key));
+  explicit_bzero (val_key, sizeof (val_key));
+  return ok;
+}
+
+/* Seed as python-validity builds it: whole stripped lines, not the first
+ * word (they differ when the DMI name or serial contains spaces). */
+static guint8 *
+dmi_full_line_seed (gsize *seed_len)
+{
+  g_autofree char *name = NULL;
+  g_autofree char *serial = NULL;
+  gsize name_len, serial_len;
+  guint8 *seed;
+
+  if (!g_file_get_contents (DMI_PRODUCT_NAME_NODE, &name, NULL, NULL) ||
+      !g_file_get_contents (DMI_PRODUCT_SERIAL_NODE, &serial, NULL, NULL))
+    return NULL;
+
+  g_strstrip (name);
+  g_strstrip (serial);
+  name_len = strlen (name);
+  serial_len = strlen (serial);
+
+  *seed_len = name_len + serial_len + 2;
+  seed = g_malloc0 (*seed_len);
+  memcpy (seed, name, name_len + 1);
+  memcpy (seed + name_len + 1, serial, serial_len + 1);
+
+  return seed;
+}
+
+static gboolean parse_tls_flash_blob (VfsInit *vinit,
+                                      const unsigned char *buf, size_t n,
+                                      const char *found_path);
+
+static gboolean
+is_test_seed (VfsInit *vinit)
+{
+  return vinit->main_seed_length == sizeof (TEST_SEED) &&
+         memcmp (TEST_SEED, vinit->main_seed, sizeof (TEST_SEED)) == 0;
+}
+
+static gboolean
+load_tls_flash_from_disk (VfsInit *vinit)
+{
+  /* Host half of the pairing (python-validity make_tls_flash format).
+   * Must be a regular file owned by root (or by the user running the
+   * driver, for testing) and not writable by group or others. */
+  const char *found_path = "/etc/python-validity/tls-flash.bin";
+  struct stat st;
+  int fd;
+
+  fd = open (found_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+  if (fd < 0)
+    {
+      fp_info ("No host TLS key file %s: %s", found_path, g_strerror (errno));
+      return FALSE;
+    }
+
+  if (fstat (fd, &st) != 0 || !S_ISREG (st.st_mode) ||
+      (st.st_uid != 0 && st.st_uid != geteuid ()) ||
+      (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+    {
+      fp_warn ("Refusing %s: must be a regular file owned by root and not "
+               "group/world writable", found_path);
+      close (fd);
+      return FALSE;
+    }
+
+  fp_info ("Loading TLS credentials from %s", found_path);
+
+  unsigned char buf[4096];
+  size_t n = 0;
+  gboolean ret;
+
+  while (n < sizeof (buf))
+    {
+      ssize_t rd = read (fd, buf + n, sizeof (buf) - n);
+
+      if (rd < 0 && errno == EINTR)
+        continue;
+      if (rd <= 0)
+        break;
+      n += rd;
+    }
+  close (fd);
+
+  ret = parse_tls_flash_blob (vinit, buf, n, found_path);
+  explicit_bzero (buf, sizeof (buf));
+
+  return ret;
+}
+
+static gboolean
+parse_tls_flash_blob (VfsInit *vinit,
+                      const unsigned char *buf, size_t n,
+                      const char *found_path)
+{
+  if (n < 512)
+    {
+      fp_warn ("tls-flash.bin too short: %zu bytes", n);
+      return FALSE;
+    }
+
+  /* Parse TLV blocks */
+  size_t offset = 0;
+  const unsigned char *priv_body = NULL;
+  size_t priv_len = 0;
+  const unsigned char *cert_body = NULL;
+  size_t cert_len = 0;
+  const unsigned char *ecdh_body = NULL;
+  size_t ecdh_len = 0;
+
+  while (offset + 36 <= n)
+    {
+      uint16_t id = buf[offset] | (buf[offset + 1] << 8);
+      uint16_t sz = buf[offset + 2] | (buf[offset + 3] << 8);
+
+      if (id == 0xffff || offset + 36 + sz > n)
+        break;
+
+      const unsigned char *body = buf + offset + 36;
+
+      if (id == 4)
+        {
+          priv_body = body;
+          priv_len = sz;
+        }
+      else if (id == 3)
+        {
+          cert_body = body;
+          cert_len = sz;
+        }
+      else if (id == 6)
+        {
+          ecdh_body = body;
+          ecdh_len = sz;
+        }
+
+      offset += 36 + sz;
+    }
+
+  if (!priv_body || !cert_body || !ecdh_body)
+    {
+      fp_warn ("Required TLV blocks (3, 4, 6) missing in %s", found_path);
+      return FALSE;
+    }
+
+  /* 1. Pick the seed (system DMI one, else python-validity's non-root
+   *    fallback) whose GWK key validates the key blob HMAC. */
+  if (priv_len != 1 + 0x10 + 0x70 + 0x20 || priv_body[0] != 0x02)
+    {
+      fp_warn ("Unexpected private key block in %s (len %zu)", found_path, priv_len);
+      return FALSE;
+    }
+
+  if (!key_blob_matches_seed (priv_body, vinit->main_seed,
+                              vinit->main_seed_length, vinit->masterkey_aes))
+    {
+      gsize full_len = 0;
+      g_autofree guint8 *full = dmi_full_line_seed (&full_len);
+
+      if (full && !(full_len == (gsize) vinit->main_seed_length &&
+                    memcmp (full, vinit->main_seed, full_len) == 0) &&
+          key_blob_matches_seed (priv_body, full, full_len, vinit->masterkey_aes))
+        {
+          fp_info ("Key blob in %s is wrapped with the full DMI seed", found_path);
+          g_clear_pointer (&vinit->main_seed, g_free);
+          vinit->main_seed = g_steal_pointer (&full);
+          vinit->main_seed_length = full_len;
+        }
+      else if (!is_test_seed (vinit) &&
+               key_blob_matches_seed (priv_body, TEST_SEED, sizeof (TEST_SEED),
+                                      vinit->masterkey_aes))
+        {
+          fp_info ("Key blob in %s is wrapped with the fallback seed", found_path);
+          g_clear_pointer (&vinit->main_seed, g_free);
+          vinit->main_seed = g_memdup2 (TEST_SEED, sizeof (TEST_SEED));
+          vinit->main_seed_length = sizeof (TEST_SEED);
+        }
+      else
+        {
+          fp_warn ("Key blob in %s does not match this machine's seed", found_path);
+          return FALSE;
+        }
+    }
+
+  /* 2. Decrypt the ECDSA private key */
+  if (!initialize_ecdsa_key (vinit, (unsigned char *) priv_body + 1, 0x70))
+    {
+      fp_warn ("Failed to decrypt ECDSA key from %s", found_path);
+      return FALSE;
+    }
+
+  /* 3. Setup TLS certificate */
+  memcpy (vinit->tls_certificate, TLS_CERTIFICATE_BASE,
+          G_N_ELEMENTS (TLS_CERTIFICATE_BASE));
+  if (cert_len != 0xb8)
+    {
+      fp_warn ("Unexpected TLS certificate size %zu in %s", cert_len, found_path);
+      return FALSE;
+    }
+  memcpy (vinit->tls_certificate + 21, cert_body, 0xb8);
+
+  /* 4. Setup Server Public Key from ECDH blob (Block 6) */
+  const int half_key = VFS_PUBLIC_KEY_SIZE / 2;
+  if (ecdh_len >= 0x4c + half_key)
+    {
+      memcpy (vinit->pubkey, ecdh_body + 8, half_key);
+      memcpy (vinit->pubkey + half_key, ecdh_body + 0x4c, half_key);
+      reverse_mem (vinit->pubkey, half_key);
+      reverse_mem (vinit->pubkey + half_key, half_key);
+    }
+  else
+    {
+      fp_warn ("ECDH block too short in %s", found_path);
+      return FALSE;
+    }
+
+  return TRUE;
 }
 
 static void
@@ -1469,15 +1737,58 @@ init_ssm (FpiSsm *ssm, FpDevice *dev)
           break;
         }
 
+    /* fallthrough */
     case INIT_STATE_SEQ_1:
     case INIT_STATE_SEQ_3:
     case INIT_STATE_SEQ_4:
     case INIT_STATE_SEQ_5:
+      /* Reply to 0x43 02 (SEQ_3): 84 bytes with fwext, or exactly 0x04af
+       * on ROM-only sensors whose flash the host can't access */
+      if (fpi_ssm_get_cur_state (ssm) == INIT_STATE_SEQ_4 &&
+          vdev->buffer_length != 84 &&
+          !(vdev->buffer_length == 2 &&
+            vdev->buffer[0] == 0xaf && vdev->buffer[1] == 0x04))
+        {
+          fp_err ("Unexpected fwext info reply (%d bytes)", vdev->buffer_length);
+          print_hex (vdev->buffer, vdev->buffer_length);
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+          break;
+        }
+
+      send_init_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - INIT_STATE_SEQ_1);
+      break;
+
     case INIT_STATE_SEQ_6:
       send_init_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - INIT_STATE_SEQ_1);
       break;
 
     case INIT_STATE_MASTER_KEY:
+      /* SEQ_6 read the TLS keys from flash partition 1 (0x40). Host-paired
+       * sensors refuse it (0x04af): use the host-stored copy instead. */
+      if (vdev->buffer_length < 2 || vdev->buffer[0] || vdev->buffer[1])
+        {
+          guint8 st0 = vdev->buffer_length > 0 ? vdev->buffer[0] : 0;
+          guint8 st1 = vdev->buffer_length > 1 ? vdev->buffer[1] : 0;
+
+          if (load_tls_flash_from_disk (vinit))
+            {
+              fp_info ("Sensor flash not readable (status 0x%02x%02x). "
+                       "Loaded TLS credentials from disk, starting TLS handshake",
+                       st1, st0);
+              vdev->host_paired = TRUE;
+              fpi_ssm_jump_to_state (ssm, INIT_STATE_HANDSHAKE);
+              break;
+            }
+
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (
+                                 FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                 "Sensor flash not readable (status 0x%02x%02x) and "
+                                 "no usable /etc/python-validity/tls-flash.bin "
+                                 "(must be readable by the driver, i.e. run as root)",
+                                 st1, st0));
+          break;
+        }
+
       TLS_PRF2 (PRE_KEY, sizeof (PRE_KEY), "GWK", vinit->main_seed,
                 vinit->main_seed_length,
                 vinit->masterkey_aes, VFS_MASTER_KEY_SIZE);
@@ -1490,7 +1801,7 @@ init_ssm (FpiSsm *ssm, FpDevice *dev)
         {
           fpi_ssm_next_state (ssm);
         }
-      else if (memcmp (TEST_SEED, vinit->main_seed, vinit->main_seed_length) != 0)
+      else if (!is_test_seed (vinit))
         {
           fp_info ("Failed using system seed for ECDSA key generation, "
                    "trying with a VirtualBox one");
@@ -1548,14 +1859,12 @@ init_ssm (FpiSsm *ssm, FpDevice *dev)
 static void
 dev_open_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  /* Notify open complete */
+  /* Complete exactly once: the old code also called fpi_device_action_error,
+   * which completed the action a second time with a freed error (crash). */
   if (error)
-    fpi_device_action_error (dev, error);
-
-  if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-    fpi_device_open_complete (dev, error);
-  else
     vfs0090_deinit (FPI_DEVICE_VFS0090 (dev), NULL);
+
+  fpi_device_open_complete (dev, error);
 }
 
 static gboolean
@@ -1614,6 +1923,8 @@ dev_open (FpDevice *dev)
 
   if (!vfs0090_init (vdev))
     return;
+
+  vdev->host_paired = FALSE;
 
   /* Clearing previous device state */
   ssm = fpi_ssm_new (dev, init_ssm, INIT_STATE_LAST);
@@ -2120,6 +2431,9 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
 
   if (!error)
     {
+      GPtrArray *minutiae = fp_image_get_minutiae (image);
+      fp_dbg ("Detected %u minutiae points in image", minutiae ? minutiae->len : 0);
+
       print = fp_print_new (dev);
       fpi_print_set_type (print, FPI_PRINT_NBIS);
 
@@ -2225,6 +2539,74 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
 }
 
 static void
+vfs_image_enhance (unsigned char *data, int width, int height)
+{
+  int total_pixels = width * height;
+  int hist[256] = { 0 };
+  int i;
+  int cdf = 0;
+  int p2_threshold = (total_pixels * 2) / 100;
+  int p98_threshold = (total_pixels * 98) / 100;
+  int low_val = 0;
+  int high_val = 255;
+  int min_val = 255;
+  int max_val = 0;
+  gboolean low_found = FALSE;
+
+  for (i = 0; i < total_pixels; i++)
+    {
+      unsigned char v = data[i];
+      hist[v]++;
+      if (v < min_val)
+        min_val = v;
+      if (v > max_val)
+        max_val = v;
+    }
+
+  for (i = 0; i < 256; i++)
+    {
+      cdf += hist[i];
+      if (!low_found && cdf >= p2_threshold)
+        {
+          low_val = i;
+          low_found = TRUE;
+        }
+      if (cdf >= p98_threshold)
+        {
+          high_val = i;
+          break;
+        }
+    }
+
+  if (high_val <= low_val)
+    {
+      low_val = min_val;
+      high_val = max_val;
+    }
+
+  fp_dbg ("vfs0090 image stats: raw min=%d, max=%d, p2=%d, p98=%d",
+          min_val, max_val, low_val, high_val);
+
+  /* Near-blank frame: stretching would only amplify noise */
+  if (high_val - low_val < 24)
+    return;
+
+  if (high_val > low_val)
+    {
+      int range = high_val - low_val;
+      for (i = 0; i < total_pixels; i++)
+        {
+          int val = data[i];
+          if (val < low_val)
+            val = low_val;
+          else if (val > high_val)
+            val = high_val;
+          data[i] = (unsigned char) (((val - low_val) * 255) / range);
+        }
+    }
+}
+
+static void
 finger_image_submit (FpDevice         *dev,
                      VfsImageDownload *imgdown,
                      FpiSsm           *download_ssm)
@@ -2233,12 +2615,18 @@ finger_image_submit (FpDevice         *dev,
   VfsMinutiaeDetection *minutiae_data;
   FpImage *img;
 
+  /* Uncalibrated ROM-only frames are low contrast */
+  if (vdev->host_paired)
+    vfs_image_enhance (imgdown->image, VFS_IMAGE_SIZE, VFS_IMAGE_SIZE);
+
   img = fp_image_new (VFS_IMAGE_SIZE, VFS_IMAGE_SIZE);
   img->flags = FPI_IMAGE_H_FLIPPED;
   memcpy (img->data, imgdown->image, VFS_IMAGE_SIZE * VFS_IMAGE_SIZE);
 
 #if HAVE_PIXMAN
-  if (VFS_IMAGE_RESCALE > 1)
+  /* Upstream builds never defined HAVE_PIXMAN, so normally paired sensors
+   * keep matching unscaled images (existing enrollments stay valid). */
+  if (VFS_IMAGE_RESCALE > 1 && vdev->host_paired)
     {
       g_autoptr(FpImage) resized = NULL;
 
@@ -2252,8 +2640,9 @@ finger_image_submit (FpDevice         *dev,
   minutiae_data->download_ssm = download_ssm;
 
   fp_dbg ("Detecting minutiae");
+  /* vdev->cancellable is already cleared after the last image chunk */
   fp_image_detect_minutiae (img,
-                            vdev->cancellable,
+                            fpi_device_get_cancellable (dev),
                             minutiae_detected,
                             minutiae_data);
 }
@@ -2319,6 +2708,14 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
       fpi_ssm_mark_failed (ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                                      "Expected image data size mismatch"));
+      return;
+    }
+
+  if (imgdown->image_size + data_size > sizeof (imgdown->image))
+    {
+      fpi_ssm_mark_failed (ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                     "Image data larger than expected"));
       return;
     }
 
@@ -2397,6 +2794,15 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
 
 
     case IMAGE_DOWNLOAD_STATE_SUBMIT_IMAGE:
+      if (imgdown->image_size != sizeof (imgdown->image))
+        {
+          fpi_ssm_mark_failed (ssm,
+                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                         "Incomplete image: %d bytes",
+                                                         imgdown->image_size));
+          break;
+        }
+
       if (use_database_matching (dev))
         start_finger_db_check_subsm (dev, ssm);
       else
@@ -2589,6 +2995,86 @@ finger_scan_interrupt_callback (FpiUsbTransfer *transfer, FpDevice *dev,
     fpi_ssm_jump_to_state (ssm, interrupt_type);
 }
 
+/* Host-paired 0090 (ROM only, no fwext): after the finger-down interrupt the
+ * sensor sends no "scan in progress/completed" interrupts. The capture
+ * program status (0x51 00 00 00 00, first byte) goes 1 -> 2 -> 0 instead,
+ * and the image is then readable with 0x51 00 20 00 00 as usual. */
+#define VFS_PRG_POLL_INTERVAL_MS 100
+#define VFS_PRG_POLL_MAX 100
+
+static void
+capture_program_status_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                           gpointer data, GError *error)
+{
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  FpiSsm *ssm = data;
+  guint8 status;
+
+  vdev->poll_in_flight = FALSE;
+
+  if (error || vdev->deactivating)
+    {
+      vdev->poll_ssm = NULL;
+      /* While deactivating the action is already being completed with the
+       * stored error: report CANCELLED so the scan callback stays quiet. */
+      if (vdev->deactivating)
+        {
+          g_clear_error (&error);
+          error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                       "Capture cancelled");
+        }
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  /* Progress replies are 6 bytes; a 2-byte reply is an error status */
+  if (vdev->buffer_length < 3)
+    {
+      vdev->poll_ssm = NULL;
+      fp_err ("Unexpected capture status reply");
+      print_hex (vdev->buffer, vdev->buffer_length);
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+      return;
+    }
+
+  status = vdev->buffer[0];
+  fp_dbg ("Capture program status %d (poll %u)", status, vdev->prg_polls);
+
+  if (status == 0 || status == 7)
+    {
+      vdev->poll_ssm = NULL;
+      fpi_ssm_jump_to_state (ssm, SCAN_STATE_SUCCESS);
+    }
+  else if (++vdev->prg_polls > VFS_PRG_POLL_MAX)
+    {
+      vdev->poll_ssm = NULL;
+      fp_warn ("Capture program did not finish, status %d", status);
+      fpi_ssm_jump_to_state (ssm, SCAN_STATE_FAILED_TOO_SHORT);
+    }
+  else
+    {
+      vdev->poll_delay_pending = TRUE;
+      fpi_ssm_jump_to_state_delayed (ssm, SCAN_STATE_IN_PROGRESS,
+                                     VFS_PRG_POLL_INTERVAL_MS);
+    }
+}
+
+static void
+poll_capture_program_status (FpDevice *dev, FpiSsm *ssm)
+{
+  FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
+  static const unsigned char prg_status[] = { 0x51, 0x00, 0x00, 0x00, 0x00 };
+
+  vdev->poll_ssm = ssm;
+  vdev->poll_delay_pending = FALSE;
+  vdev->poll_in_flight = TRUE;
+  /* Byte 0 is the program state, not a status word */
+  async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED_ANY_STATUS,
+                       prg_status, sizeof (prg_status),
+                       vdev->buffer, VFS_USB_BUFFER_SIZE,
+                       capture_program_status_cb, ssm);
+}
+
 static void
 finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
 {
@@ -2600,8 +3086,23 @@ finger_scan_ssm (FpiSsm *ssm, FpDevice *dev)
     case SCAN_STATE_FINGER_ON_SENSOR:
       fp_dbg ("Finger on sensor...");
 
-    case SCAN_STATE_WAITING_FOR_FINGER:
+      if (vdev->host_paired)
+        {
+          fpi_ssm_jump_to_state (ssm, SCAN_STATE_IN_PROGRESS);
+          break;
+        }
+    /* fallthrough */
+
     case SCAN_STATE_IN_PROGRESS:
+      if (vdev->host_paired &&
+          fpi_ssm_get_cur_state (ssm) == SCAN_STATE_IN_PROGRESS)
+        {
+          poll_capture_program_status (dev, ssm);
+          break;
+        }
+    /* fallthrough */
+
+    case SCAN_STATE_WAITING_FOR_FINGER:
     case SCAN_STATE_COMPLETED:
       async_read_from_usb (dev, FP_TRANSFER_INTERRUPT,
                            vdev->buffer, VFS_USB_INTERRUPT_BUFFER_SIZE,
@@ -2651,6 +3152,7 @@ start_finger_scan (FpDevice *dev)
   FpiSsm *ssm;
 
   ssm = fpi_ssm_new (dev, finger_scan_ssm, SCAN_STATE_LAST);
+  FPI_DEVICE_VFS0090 (dev)->prg_polls = 0;
   fpi_ssm_start (ssm, finger_scan_callback);
 }
 
@@ -2658,7 +3160,11 @@ static void
 send_activate_sequence (FpiDeviceVfs0090 *vdev, FpiSsm *ssm,
                         int sequence)
 {
-  do_data_exchange (vdev, ssm, &ACTIVATE_SEQUENCES[sequence], DATA_EXCHANGE_ENCRYPTED);
+  /* SCAN_MATRIX may answer 0x0450 ("already active"): checked in WAIT_DEVICE */
+  int mode = (sequence == ACTIVATE_STATE_SCAN_MATRIX - ACTIVATE_STATE_SEQ_1) ?
+             DATA_EXCHANGE_ENCRYPTED_ANY_STATUS : DATA_EXCHANGE_ENCRYPTED;
+
+  do_data_exchange (vdev, ssm, &ACTIVATE_SEQUENCES[sequence], mode);
 }
 
 static void
@@ -2707,6 +3213,15 @@ activate_ssm (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case ACTIVATE_STATE_CHECK_DB:
+      if (vdev->host_paired)
+        {
+          /* No on-chip DB without fwext: 0x4b answers 0x04b4 */
+          fp_dbg ("Host-paired sensor, skipping internal DB dump");
+          vdev->db_checked = TRUE;
+          vdev->db_has_prints = FALSE;
+          fpi_ssm_jump_to_state (ssm, ACTIVATE_STATE_GREEN_LED_ON);
+          break;
+        }
 
       if (!vdev->db_checked)
         {
@@ -2749,13 +3264,20 @@ activate_ssm (FpiSsm *ssm, FpDevice *dev)
                            async_transfer_callback_with_ssm, ssm);
       break;
 
+    case ACTIVATE_STATE_SEQ_6:
+    case ACTIVATE_STATE_SEQ_7:
+      /* 0x43 02 (fwext info) answers 0x04af on host-paired sensors */
+      if (vdev->host_paired)
+        {
+          fpi_ssm_next_state (ssm);
+          break;
+        }
+    /* fallthrough */
     case ACTIVATE_STATE_SEQ_1:
     case ACTIVATE_STATE_SEQ_2:
     case ACTIVATE_STATE_SEQ_3:
     case ACTIVATE_STATE_SEQ_4:
     case ACTIVATE_STATE_SEQ_5:
-    case ACTIVATE_STATE_SEQ_6:
-    case ACTIVATE_STATE_SEQ_7:
     case ACTIVATE_STATE_SCAN_MATRIX:
       send_activate_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - ACTIVATE_STATE_SEQ_1);
       break;
@@ -2765,6 +3287,15 @@ activate_ssm (FpiSsm *ssm, FpDevice *dev)
         {
           fp_info ("Waiting for device not needed, already active");
           fpi_ssm_next_state (ssm);
+          break;
+        }
+
+      if (vdev->buffer_length == 2 && (vdev->buffer[0] || vdev->buffer[1]))
+        {
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (
+                                 FP_DEVICE_ERROR_PROTO,
+                                 "Scan matrix rejected, status 0x%02x%02x",
+                                 vdev->buffer[1], vdev->buffer[0]));
           break;
         }
 
@@ -2786,11 +3317,28 @@ dev_activate_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceVfs0090 *vdev = FPI_DEVICE_VFS0090 (dev);
 
-  if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) && error)
-    fp_err ("Activation failed failed at state %d, unexpected "
-            "device reply during activation", fpi_ssm_get_cur_state (ssm));
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    {
+      /* Cancelled before activation finished (dev_cancel) */
+      fpi_device_action_error (dev, error);
+      return;
+    }
 
   vdev->activated = TRUE;
+
+  if (error)
+    {
+      fp_err ("Activation failed at state %d, unexpected "
+              "device reply during activation", fpi_ssm_get_cur_state (ssm));
+
+      /* Don't scan on a half-armed sensor: clean up (0x04 when host-paired,
+       * 0x62, LED off) and report the error. */
+      if (!vdev->action_error)
+        vdev->action_error = g_steal_pointer (&error);
+      g_clear_error (&error);
+      dev_deactivate (dev);
+      return;
+    }
 
   start_finger_scan (dev);
 }
@@ -2842,13 +3390,60 @@ deactivate_ssm (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case DEACTIVATE_STOP_TRANSFER:
+      if (vdev->poll_in_flight)
+        {
+          /* Let the running status exchange finish; its callback sees
+           * deactivating and fails the scan with CANCELLED. Cancelling it
+           * mid-exchange could leave its reply queued on the sensor. */
+          fpi_ssm_jump_to_state_delayed (ssm, DEACTIVATE_STOP_TRANSFER, 10);
+          break;
+        }
+
+      if (vdev->poll_ssm && vdev->poll_delay_pending)
+        {
+          FpiSsm *poll_ssm = g_steal_pointer (&vdev->poll_ssm);
+
+          vdev->poll_delay_pending = FALSE;
+          fpi_ssm_cancel_delayed_state_change (poll_ssm);
+          fpi_ssm_mark_failed (poll_ssm,
+                               g_error_new_literal (G_IO_ERROR,
+                                                    G_IO_ERROR_CANCELLED,
+                                                    "Capture cancelled"));
+        }
+
       g_cancellable_cancel (vdev->cancellable);
       g_clear_object (&vdev->cancellable);
 
       fpi_ssm_next_state (ssm);
       break;
 
+    case DEACTIVATE_STATE_CAPTURE_STOP:
+      /* Host-paired 0090: stop/clean up the capture program (0x04, as
+       * python-validity does). Replies 0x0412 when already finished. */
+      if (vdev->host_paired)
+        {
+          static const unsigned char capture_stop[] = { 0x04 };
+
+          async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED_ANY_STATUS,
+                               capture_stop, sizeof (capture_stop),
+                               vdev->buffer, VFS_USB_BUFFER_SIZE,
+                               async_transfer_callback_with_ssm, ssm);
+          break;
+        }
+      fpi_ssm_next_state (ssm);
+      break;
+
     case DEACTIVATE_STATE_SEQ_1:
+      /* 0x62 replies 0x0401 on host-paired 0090, even after a good scan */
+      if (vdev->host_paired)
+        {
+          async_data_exchange (dev, DATA_EXCHANGE_ENCRYPTED_ANY_STATUS,
+                               DEACTIVATE_SEQUENCES[0].msg,
+                               DEACTIVATE_SEQUENCES[0].msg_length,
+                               vdev->buffer, VFS_USB_BUFFER_SIZE,
+                               async_transfer_callback_with_ssm, ssm);
+          break;
+        }
       send_deactivate_sequence (vdev, ssm, fpi_ssm_get_cur_state (ssm) - DEACTIVATE_STATE_SEQ_1);
       break;
 
@@ -3086,12 +3681,10 @@ dev_cancel (FpDevice *dev)
 
   if (!vdev->activated)
     {
-      GError *error = NULL;
-
+      /* The running activation fails with CANCELLED and completes the
+       * action; deinit is left to dev_close (the pending transfer still
+       * targets vdev->buffer). */
       g_cancellable_cancel (vdev->cancellable);
-
-      if (!vfs0090_deinit (vdev, &error))
-        fpi_device_action_error (dev, error);
       return;
     }
 

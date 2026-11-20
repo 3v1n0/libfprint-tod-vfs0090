@@ -2322,6 +2322,15 @@ finger_image_download_read_callback (FpiUsbTransfer *transfer, FpDevice *dev,
       return;
     }
 
+  if (imgdown->image_size < 0 ||
+      (gsize) imgdown->image_size > sizeof (imgdown->image) ||
+      data_size > sizeof (imgdown->image) - (gsize) imgdown->image_size)
+    {
+      fpi_ssm_mark_failed (ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                     "Image data exceeds frame capacity"));
+      return;
+    }
   fp_dbg ("Getting %d bytes of image data", data_size);
   memcpy (imgdown->image + imgdown->image_size, image_data, data_size);
   imgdown->image_size += data_size;

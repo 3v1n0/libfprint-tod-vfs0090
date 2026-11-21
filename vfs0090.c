@@ -57,6 +57,12 @@ struct _FpiDeviceVfs0090
   unsigned int   enroll_stage;
   FpiMatchResult match_result;
   GError        *action_error;
+
+  /* Result held back until the LED blink is done, see hold_report() */
+  gboolean       report_pending;
+  FpPrint       *report_match;
+  FpPrint       *report_print;
+  GError        *report_error;
   FpPrint       *enrolled_print;
   FpImage       *captured_image;
 
@@ -2078,6 +2084,62 @@ typedef struct _VfsMinutiaeDetection
 } VfsMinutiaeDetection;
 
 static void
+hold_report (FpiDeviceVfs0090 *vdev, FpPrint *match, FpPrint *print, GError *error)
+{
+  /* Reporting the result makes the caller stop the action, which cancels the
+   * LED blink that is still in flight and leaves the sensor out of step. Hold
+   * the result until the blink is done. */
+  g_clear_object (&vdev->report_print);
+  g_clear_error (&vdev->report_error);
+
+  vdev->report_pending = TRUE;
+  vdev->report_match = match;
+  vdev->report_print = print;
+  vdev->report_error = error;
+}
+
+static void
+clear_held_report (FpiDeviceVfs0090 *vdev)
+{
+  vdev->report_pending = FALSE;
+  vdev->report_match = NULL;
+  g_clear_object (&vdev->report_print);
+  g_clear_error (&vdev->report_error);
+}
+
+static void
+flush_report (FpiDeviceVfs0090 *vdev)
+{
+  FpDevice *dev = FP_DEVICE (vdev);
+
+  if (!vdev->report_pending)
+    return;
+
+  vdev->report_pending = FALSE;
+
+  switch (fpi_device_get_current_action (dev))
+    {
+    case FPI_DEVICE_ACTION_VERIFY:
+      fpi_device_verify_report (dev, vdev->match_result,
+                                g_steal_pointer (&vdev->report_print),
+                                g_steal_pointer (&vdev->report_error));
+      break;
+
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      fpi_device_identify_report (dev, vdev->report_match,
+                                  g_steal_pointer (&vdev->report_print),
+                                  g_steal_pointer (&vdev->report_error));
+      break;
+
+    default:
+      g_clear_object (&vdev->report_print);
+      g_clear_error (&vdev->report_error);
+    }
+
+  vdev->report_match = NULL;
+}
+
+static void
 minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
   g_autoptr(FpImage) image = FP_IMAGE (source_object);
@@ -2177,9 +2239,8 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
                 vdev->match_result == FPI_MATCH_SUCCESS ? "match" : "no-match");
 
         if (!error || error->domain == FP_DEVICE_RETRY)
-          fpi_device_verify_report (dev, vdev->match_result,
-                                    g_steal_pointer (&print),
-                                    g_steal_pointer (&error));
+          hold_report (vdev, NULL, g_steal_pointer (&print),
+                       g_steal_pointer (&error));
 
         vdev->action_error = g_steal_pointer (&error);
         fpi_ssm_jump_to_state (download_ssm, IMAGE_DOWNLOAD_STATE_CHECK_RESULT);
@@ -2210,8 +2271,8 @@ minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data
         fp_dbg ("Identified finger minutiae: %s", result ? "match" : "no-match");
 
         if (!error || error->domain == FP_DEVICE_RETRY)
-          fpi_device_identify_report (dev, result, g_steal_pointer (&print),
-                                      g_steal_pointer (&error));
+          hold_report (vdev, result, g_steal_pointer (&print),
+                       g_steal_pointer (&error));
 
         vdev->action_error = g_steal_pointer (&error);
         vdev->match_result = result ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
@@ -2434,6 +2495,7 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case IMAGE_DOWNLOAD_STATE_SUBMIT_RESULT:
+      flush_report (vdev);
       restart_scan_or_deactivate (vdev);
       fpi_ssm_next_state (ssm);
       break;
@@ -2822,6 +2884,9 @@ dev_activate (FpDevice *dev)
         }
     }
 
+  /* Drop a result held back by an action that was cancelled before it was reported */
+  clear_held_report (FPI_DEVICE_VFS0090 (dev));
+
   ssm = fpi_ssm_new (dev, activate_ssm, ACTIVATE_STATE_LAST);
   fpi_ssm_start (ssm, dev_activate_callback);
 }
@@ -3095,7 +3160,9 @@ dev_cancel (FpDevice *dev)
       return;
     }
 
-  if (vdev->deactivating && vdev->action_error)
+  /* The result is in and the sensor is shutting down: cancelling now would
+   * abort the transfers that bring it back to idle. */
+  if (vdev->deactivating)
     return;
 
   g_set_error (&vdev->action_error, G_IO_ERROR, G_IO_ERROR_CANCELLED,

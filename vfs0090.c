@@ -2380,6 +2380,10 @@ finger_image_download_ssm (FpiSsm *ssm, FpDevice *dev)
     0x51, 0x00, 0x20, 0x00, 0x00
   };
 
+  /* A delayed state can fire after the device was closed and the buffer freed */
+  if (!vdev->buffer)
+    return;
+
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case IMAGE_DOWNLOAD_STATE_1:

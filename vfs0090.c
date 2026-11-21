@@ -2801,6 +2801,9 @@ dev_activate (FpDevice *dev)
   FpiSsm *ssm;
   FpiDeviceAction action = fpi_device_get_current_action (dev);
 
+  if (action == FPI_DEVICE_ACTION_ENROLL)
+    FPI_DEVICE_VFS0090 (dev)->enroll_stage = 0;
+
   if (action == FPI_DEVICE_ACTION_CAPTURE)
     {
       gboolean wait_for_finger;

@@ -2560,6 +2560,16 @@ finger_scan_callback (FpiSsm *ssm, FpDevice *dev, GError *error)
       fp_err ("Scan failed failed at state %d, unexpected "
               "device reply during finger scanning", fpi_ssm_get_cur_state (ssm));
 
+      if (g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID))
+        {
+          /* The sensor flagged a poor touch: report a retry, as for a swipe
+           * that was too fast, then restart or finish the action. */
+          g_clear_error (&error);
+          report_retry_error (dev, FP_DEVICE_RETRY_GENERAL);
+          restart_scan_or_deactivate (FPI_DEVICE_VFS0090 (dev));
+          return;
+        }
+
       fpi_device_action_error (dev, error);
     }
   else
